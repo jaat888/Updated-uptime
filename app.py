@@ -41,7 +41,8 @@ INPAGE_PATHS = [x.strip() for x in os.environ.get("INPAGE_PATHS", "/").split(","
 RETRY_MIN, RETRY_MAX = 60, 180                        # wake fail ho to itne sec baad dobara
 LOG_DAYS = env_int("LOG_DAYS", 3)
 COOKIE_DAYS = env_int("COOKIE_DAYS", 3)
-MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser restart hoga
+MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser restart hoga (visit ke baad)
+MEM_VISIT_LIMIT = env_int("MEM_VISIT_LIMIT_MB", MEM_LIMIT + 10)   # visit ke BEECH me itne par hi visit jaldi khatam (pehle 500 tha)
 MAX_HOURS = env_int("BROWSER_MAX_HOURS", 12)    # itne ghante baad browser restart (safety)
 MAX_LOG_LINES = 20000
 MAX_STATE_BYTES = 300 * 1024
@@ -308,22 +309,22 @@ POOL_COUNTRIES = [c.strip().upper() for c in os.environ.get("POOL_COUNTRIES", "I
 IPLOC = "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/countries/"
 POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 30)) * 60
 POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 150))
-POOL_KEEP = max(1, env_int("POOL_KEEP", 15))
+POOL_KEEP = max(1, env_int("POOL_KEEP", 40))
 POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
-POOL_WORKERS = max(1, min(20, env_int("POOL_WORKERS", 15)))     # 20 se upar nahi (Render free par RAM bachane ke liye)
+POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 20)))     # ek saath itne test (40 se upar nahi)
 POOL_BATCH = max(10, env_int("POOL_BATCH", 60))                  # itne proxy ek saath, phir RAM check
 BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0      # visit ke baad Chromium band (RAM khali), agli visit par phir khulega
 IDLE_REASON = "idle ke baad"
 POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 100)                        # proxy se jagane ke liye max wait (sec), phir seedha retry
-POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 380)               # itni RAM (MB) se upar ho to test ruk jata hai
+POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 430)               # itni RAM (MB) se upar ho to test ruk jata hai
 # ---- khali time me scan: agli visit tak jitna time bacha, utne me proxy test (max POOL_TEST_MAX)
 POOL_IDLE = env_int("POOL_IDLE_SCAN", 1) != 0
-POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 400))                 # ek khali-window me max itne proxy
+POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 1000))                 # ek khali-window me max itne proxy
 POOL_IDLE_EVERY = max(2, env_int("POOL_IDLE_EVERY_MIN", 15)) * 60       # do idle scan ke beech kam se kam itna gap
 POOL_IDLE_MIN_WIN = env_int("POOL_IDLE_MIN_WINDOW_SEC", 90)            # agli visit me itna time ho tabhi scan shuru
 POOL_IDLE_MARGIN = env_int("POOL_IDLE_MARGIN_SEC", 40)                 # agli visit se itna pehle scan band
 POOL_KEEP_AGE = env_int("POOL_KEEP_AGE_MIN", 120) * 60                 # purane achhe proxy itni der pool me rakho
-POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 6000)                   # roz max itne test (bandwidth bachane ke liye)
+POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 0)                      # 0 = roz ki koi limit nahi (number daalo to utne test roz)
 POOL_RETEST_SEC = 3600                                                 # ek proxy ko 1 ghante me dobara test nahi
 SCANNER_URL = os.environ.get("SCANNER_URL", "").strip().rstrip("/")     # alag scanner service ka URL (set ho to proxy test yahan nahi hoga)
 SCANNER_KEY = os.environ.get("SCANNER_KEY", "").strip()
@@ -383,7 +384,10 @@ RECENT = {"d": None}                                                   # {app_ur
 POOL_LIST_TTL = 1800                                                   # GitHub list 30 min cache (baar-baar download nahi)
 POOL_STATE = {"tested_at": {}, "day": "", "day_n": 0, "list": None, "list_t": 0.0}
 POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
-POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 1) != 0   # pool khali ho to server ke IP se visit
+POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 0) != 0   # 1 = proxy fail/pool khali ho to server ke IP se visit (default band: server IP kabhi nahi)
+POOL_START_TEST = max(10, env_int("POOL_START_TEST", 600))        # shuru me itne proxy pehle test, tabhi visit shuru
+POOL_MIN_READY = max(1, env_int("POOL_MIN_READY", 3))             # kam se kam itne chalte proxy mile to visit shuru
+POOL_RETRIES = max(0, env_int("POOL_RETRIES", 2))                 # proxy se visit fail ho to itni baar naye proxy se turant dobara
 POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
 POOL_LOCK = threading.Lock()
 POOL_EVT = threading.Event()
@@ -404,6 +408,23 @@ def proxy_auto():
     except OSError:
         pass
     return POOL_AUTO_ENV and not PROXY_URL
+
+
+class NoProxy(RuntimeError):
+    pass
+
+
+def pool_good_n():
+    now = time.time()
+    with POOL_LOCK:
+        return sum(1 for g in POOL["good"] if POOL["bad"].get(g["hp"], 0) < now)
+
+
+def pool_ready():
+    """Free-auto mode me visit tabhi jab warm-up scan ho chuka ho aur kam se kam 1 chalta proxy ho (server IP se visit nahi)."""
+    if not proxy_auto() or STATUS["engine"] == "obscura":
+        return True
+    return bool(POOL_STATE.get("warm")) and pool_good_n() >= 1
 
 
 def _scheme_for(src):
@@ -557,7 +578,7 @@ def pool_test_one(hp):
     return {"hp": hp, "ms": ms} if ms <= POOL_MAX_MS else None
 
 
-def pool_refresh(deadline=None):
+def pool_refresh(deadline=None, limit=None):
     """deadline (time.time() ka number) ho to khali-window scan: us time se pehle ruk jao. None = purana poora scan."""
     from concurrent.futures import ThreadPoolExecutor
     with POOL_LOCK:
@@ -575,11 +596,11 @@ def pool_refresh(deadline=None):
         if not fresh:
             ta.clear()
             fresh = allp
-        limit = POOL_TEST_MAX if deadline else POOL_TEST_N
+        limit = limit or (POOL_TEST_MAX if deadline else POOL_TEST_N)
         today = time.strftime("%Y%m%d", time.gmtime(t0 + TZ_MIN * 60))
         if POOL_STATE["day"] != today:
             POOL_STATE["day"], POOL_STATE["day_n"] = today, 0
-        if deadline:
+        if deadline and POOL_DAILY_TESTS > 0:
             limit = min(limit, POOL_DAILY_TESTS - POOL_STATE["day_n"])
         sample = fresh[:max(0, limit)]
         good = []
@@ -629,7 +650,7 @@ def pool_refresh(deadline=None):
             POOL["found"], POOL["tested"], POOL["updated"] = len(allp), done, time.time()
             POOL["note"] = (f"{done} test, {len(good)} naye chale, pool me {len(merged)}"
                             + (f", sabse tez {merged[0]['ms']} ms" if merged else "") + why
-                            + f" | aaj {POOL_STATE['day_n']}/{POOL_DAILY_TESTS} test")
+                            + f" | aaj {POOL_STATE['day_n']}" + (f"/{POOL_DAILY_TESTS}" if POOL_DAILY_TESTS > 0 else "") + " test")
         msg = f"free proxy pool: {POOL['note']}"
         log(msg)
         log_add({"event": "proxy", "msg": msg})
@@ -665,6 +686,7 @@ def pool_sync_scanner():
             POOL["updated"] = now
             POOL["found"], POOL["tested"] = d.get("count", len(good)), 0
             POOL["note"] = f"scanner se {len(good)} proxy, sabse tez {min(g['ms'] for g in good)} ms"
+            POOL_STATE["warm"] = True
         log("pool:", POOL["note"])
     except Exception as e:
         with POOL_LOCK:
@@ -674,6 +696,7 @@ def pool_sync_scanner():
 
 def pool_loop():
     last = 0.0
+    last_warm = 0.0
     while True:
         try:
             if scanner_cfg()[0] and proxy_auto() and STATUS["engine"] != "obscura":
@@ -683,7 +706,18 @@ def pool_loop():
                     last = time.time()
                 POOL_EVT.wait(timeout=15)
                 continue
-            if proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"]:
+            if proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"] and not pool_ready():
+                # warm-up (ya pool poora khali): visit ruki hain, pehle bada scan (daily limit se alag)
+                if time.time() - last_warm >= 20:
+                    last_warm = time.time()
+                    POOL_EVT.clear()
+                    log(f"pool: {POOL_START_TEST} proxy ka scan shuru, tab tak visit ruki hain")
+                    pool_refresh(limit=POOL_START_TEST)
+                    if pool_good_n() >= POOL_MIN_READY or (POOL_STATE.get("warm") and pool_good_n() >= 1):
+                        POOL_STATE["warm"] = True
+                        log_add({"event": "proxy", "msg": f"pool tayyar ({pool_good_n()} proxy), visit shuru"})
+                    last = time.time()
+            elif proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"]:
                 now = time.time()
                 browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or now - last > POOL_REFRESH * 3
                 forced = POOL_EVT.is_set() or last == 0.0                    # dashboard se "Free auto" ya server start
@@ -698,7 +732,7 @@ def pool_loop():
                         last = time.time()
         except Exception as e:
             log("pool loop error:", type(e).__name__)
-        POOL_EVT.wait(timeout=30)
+        POOL_EVT.wait(timeout=10 if (proxy_auto() and not pool_ready()) else 30)
 
 
 def pool_pick(url=None):
@@ -1441,9 +1475,9 @@ def human_dwell(page, url, obs, touch):
         while time.time() - d0 < target:
             if time.time() - mem_chk > 4:               # RAM sakht: limit paar hote hi visit samet lo, browser agli baar naya
                 mem_chk = time.time()
-                if mem_mb() > MEM_LIMIT:
-                    RESTART["why"] = f"memory limit {MEM_LIMIT} MB paar (visit ke beech)"
-                    log(f"RAM {STATUS['mem_now']:.0f} MB > {MEM_LIMIT} MB, visit jaldi khatam")
+                if mem_mb() > MEM_VISIT_LIMIT:
+                    RESTART["why"] = f"memory limit {MEM_VISIT_LIMIT} MB paar (visit ke beech)"
+                    log(f"RAM {STATUS['mem_now']:.0f} MB > {MEM_VISIT_LIMIT} MB, visit jaldi khatam")
                     break
             if req_at and time.time() - d0 >= req_at[0]:
                 req_at.pop(0)
@@ -1503,7 +1537,7 @@ def visit(browser, url, direct=False):
             LAST_PX["hp"] = px
             log(f"pool proxy{' (purana, cookies ke saath)' if reused else ''}: {px} [{pool_country(px) or '?'}] phone={fp['model']} Android {fp['android']} tz={fp['timezone_id']}")
         elif not POOL_FALLBACK_DIRECT:
-            raise RuntimeError("pool me koi chalta proxy nahi")
+            raise NoProxy("pool me koi chalta proxy nahi")
     if obs and had_cookies:
         try:
             ctx = browser.new_context(storage_state=sp, **kw)
@@ -1845,20 +1879,40 @@ def check_health():
         launch_browser(f"{age_h:.0f} ghante purana")
 
 
+NOTE_T = {"gate": 0.0}
+
+
 def run_one(u):
     """Ek app ko visit karo (browser crash par ek baar retry). Result dict ya None."""
+    if not pool_ready():                                  # proxy tayyar nahi: server IP se visit nahi, baad me
+        if time.time() - NOTE_T["gate"] > 600:
+            NOTE_T["gate"] = time.time()
+            log_add({"event": "proxy", "msg": "visit ruki hain: proxy pool tayyar nahi (scan chal raha hai)"})
+        return None
     for attempt in (1, 2):
         try:
             check_health()
             res = visit(get_browser(), u)
             if LAST_PX["hp"] and res and res.get("ok"):
                 recent_add(u, LAST_PX["hp"])
-            if LAST_PX["hp"] and not (res and res.get("ok")):
+            tries = 0
+            while LAST_PX["hp"] and not (res and res.get("ok")):
                 pool_mark_bad(LAST_PX["hp"], "visit ok nahi")
-                if POOL_FALLBACK_DIRECT:                      # app jagni zaroori hai: turant seedha (server IP se) ek baar aur
+                if tries < POOL_RETRIES and pool_ready():     # app jagni zaroori hai: ek aur naya proxy
+                    tries += 1
+                    log(f"proxy se app nahi jaagi, naya proxy ({tries}/{POOL_RETRIES}):", u)
+                    res = visit(get_browser(), u)
+                    if LAST_PX["hp"] and res and res.get("ok"):
+                        recent_add(u, LAST_PX["hp"])
+                    continue
+                if POOL_FALLBACK_DIRECT:                      # sirf agar tumne khud on kiya ho
                     log("proxy se app nahi jaagi, seedha retry:", u)
                     res = visit(get_browser(), u, direct=True)
+                break
             return res
+        except NoProxy:
+            log("visit ruki: koi chalta proxy nahi:", u)
+            return None
         except Exception as e:
             log("visit error:", u, type(e).__name__, str(e)[:120])
             pool_mark_bad(LAST_PX["hp"], type(e).__name__)
@@ -2065,7 +2119,8 @@ def dashboard():
             pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
             pb = " (test chal raha hai)" if POOL["busy"] else ""
         proxy_status = (f'<span class="ok">AUTO (free GitHub pool)</span> &mdash; {pg} proxy ready &middot; {esc(pn)} '
-                        f'&middot; aakhri update {pu}{pb}')
+                        f'&middot; aakhri update {pu}{pb}'
+                        + ('' if pool_ready() else ' &middot; <span class="bad">visit ruki hain (pehle scan poora hoga)</span>'))
     else:
         proxy_status = (f'<span class="ok">ON</span> &mdash; <code>{esc(mask_proxy(cur_proxy))}</code>'
                         if cur_proxy else '<span class="mut">Band hai (server ka apna IP use ho raha hai)</span>')
