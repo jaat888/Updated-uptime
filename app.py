@@ -289,6 +289,9 @@ POOL_KEEP = max(1, env_int("POOL_KEEP", 15))
 POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
 POOL_WORKERS = max(1, min(20, env_int("POOL_WORKERS", 15)))     # 20 se upar nahi (Render free par RAM bachane ke liye)
 POOL_BATCH = max(10, env_int("POOL_BATCH", 60))                  # itne proxy ek saath, phir RAM check
+BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0      # visit ke baad Chromium band (RAM khali), agli visit par phir khulega
+IDLE_REASON = "idle ke baad"
+POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 60)                        # proxy se jagane ke liye max wait (sec), phir seedha retry
 POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 380)               # itni RAM (MB) se upar ho to test ruk jata hai
 POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
 POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 1) != 0   # pool khali ho to server ke IP se visit
@@ -466,7 +469,8 @@ def pool_loop():
     last = 0.0
     while True:
         try:
-            if proxy_auto() and STATUS["engine"] != "obscura" and (POOL_EVT.is_set() or time.time() - last > POOL_REFRESH):
+            browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or time.time() - last > POOL_REFRESH * 3
+            if browser_free and proxy_auto() and STATUS["engine"] != "obscura" and (POOL_EVT.is_set() or time.time() - last > POOL_REFRESH):
                 POOL_EVT.clear()
                 pool_refresh()
                 last = time.time()
@@ -1082,9 +1086,10 @@ def human_dwell(page, url, obs, touch):
     return int(time.time() - d0), reqs
 
 
-def visit(browser, url):
+def visit(browser, url, direct=False):
     sp = state_path(url)
-    px = pool_pick() if (proxy_auto() and STATUS["engine"] != "obscura") else None
+    px = pool_pick() if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else None
+    wake_max = POOL_WAKE_MAX if px else WAKE_MAX        # kharab/dheemi proxy par 150 sec barbaad na ho
     fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
     vp = fp["viewport"]                                 # hamesha phone ka size (is_mobile ke saath desktop size mismatch hota)
     kw = dict(user_agent=fp["ua"], viewport=vp,
@@ -1204,7 +1209,7 @@ def visit(browser, url):
         first = (status, gate)
         ok = awake(status, gate)
         seen, last_load = nav["n"], time.time()
-        while not ok and time.time() - t0 < WAKE_MAX:
+        while not ok and time.time() - t0 < wake_max:
             page.wait_for_timeout(2000)       # wake page par tab khula rehne do, bar-bar reload nahi
             if nav["n"] != seen:              # wake page ne khud app khola ya naya page laya
                 seen = nav["n"]
@@ -1393,6 +1398,10 @@ def launch_browser(reason):
             STATUS["chrome_full"] = v
     except Exception:
         pass
+    if reason == IDLE_REASON:
+        STATUS["b_started"] = STATUS["b_started"] or time.time()
+        log("browser start:", f"[{engine}]", reason)
+        return BROWSER
     STATUS["b_started"] = time.time()
     STATUS["restarts"] += 1
     STATUS["last_restart"] = f"{fmt_t(time.time())} - {reason}"
@@ -1401,8 +1410,28 @@ def launch_browser(reason):
     return BROWSER
 
 
+IDLE = {"closed": False}
+
+
+def close_if_idle():
+    """Visit khatam: Chromium band karo taaki RAM khali ho (proxy test ke liye bhi jagah). Sirf main loop thread se."""
+    global BROWSER
+    if not BROWSER_CLOSE_IDLE or BROWSER is None or STATUS["engine"] == "obscura":
+        return
+    try:
+        BROWSER.close()
+    except Exception:
+        pass
+    BROWSER = None
+    IDLE["closed"] = True
+    log(f"browser band (idle), RAM abhi {mem_mb():.0f} MB")
+
+
 def get_browser():
     if BROWSER is None or not BROWSER.is_connected():
+        if IDLE["closed"]:
+            IDLE["closed"] = False
+            return launch_browser(IDLE_REASON)
         return launch_browser("pehli baar" if STATUS["b_started"] is None else "browser band tha/crash")
     return BROWSER
 
@@ -1431,6 +1460,9 @@ def run_one(u):
             res = visit(get_browser(), u)
             if LAST_PX["hp"] and not (res and res.get("ok")):
                 pool_mark_bad(LAST_PX["hp"], "visit ok nahi")
+                if POOL_FALLBACK_DIRECT:                      # app jagni zaroori hai: turant seedha (server IP se) ek baar aur
+                    log("proxy se app nahi jaagi, seedha retry:", u)
+                    res = visit(get_browser(), u, direct=True)
             return res
         except Exception as e:
             log("visit error:", u, type(e).__name__, str(e)[:120])
@@ -1500,6 +1532,7 @@ def loop_human():
                 if i < len(due_now) - 1:
                     TRIGGER.wait(timeout=random.uniform(5, 40))   # apps ke beech bhi random gap
             STATUS["running"] = False
+            close_if_idle()
             mem_mb()
         if time.time() - last_prune > 600:
             last_prune = time.time()
