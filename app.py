@@ -1248,7 +1248,8 @@ def visit(browser, url, direct=False):
             pass
     was_asleep = not (first and first[0] and first[0] < 400 and not first[1])
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
-           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage}
+           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage,
+           "via": (LAST_PX["hp"] or "seedha"), "phone": fp.get("model")}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
                  f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage} "
                  f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}]")
@@ -1387,6 +1388,10 @@ def launch_browser(reason):
             "--no-sandbox", "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
             "--enable-low-end-device-mode",
+            "--renderer-process-limit=1",                   # RAM: bahut saare renderer process nahi
+            "--disable-features=site-per-process,IsolateOrigins,Translate",
+            "--disable-site-isolation-trials",
+            "--js-flags=--max-old-space-size=128",          # JS heap par limit
             "--disable-extensions", "--disable-background-networking", "--mute-audio", "--no-first-run",
             "--window-size=412,915",                        # Android screen size
             "--force-device-scale-factor=3.0",             # Android DPR
