@@ -43,6 +43,7 @@ MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser r
 MAX_HOURS = env_int("BROWSER_MAX_HOURS", 12)    # itne ghante baad browser restart (safety)
 MAX_LOG_LINES = 20000
 MAX_STATE_BYTES = 300 * 1024
+COOKIE_MAX_PER_APP = max(1, env_int("COOKIE_MAX_PER_APP", 60))   # ek app ki itni proxy-wali cookie files tak
 MAX_APPS = 50
 TZ_MIN = env_int("TZ_OFFSET_MIN", 330)        # IST
 SUFFIXES = [s.strip().lower() for s in os.environ.get("ALLOWED_SUFFIXES", "blitz.cloud").split(",") if s.strip()]
@@ -130,8 +131,16 @@ def save_apps(apps):
         os.replace(tmp, APPS_FILE)
 
 
-def state_path(url):
-    return os.path.join(STATE_DIR, hashlib.sha1(url.encode()).hexdigest()[:16] + ".json")
+def state_prefix(url):
+    """Ek app ki saari cookie files isi naam se shuru hoti hain."""
+    return hashlib.sha1(url.encode()).hexdigest()[:12] + "_"
+
+
+def state_path(url, px=None):
+    """Cookie file har (app, proxy IP) ke liye alag. px None = seedha (server IP).
+    Isse ek IP ki cookies dusre IP/phone ke saath kabhi nahi milti."""
+    who = hashlib.sha1((px or "direct").encode()).hexdigest()[:10]
+    return os.path.join(STATE_DIR, state_prefix(url) + who + ".json")
 
 
 # ---------------------------------------------------------------- log (3 din)
@@ -172,18 +181,30 @@ def prune_log():
 
 def prune_state(apps):
     """Purani/bhari/hataye gaye apps ki cookie files delete, taaki disk na bhare."""
-    keep = {os.path.basename(state_path(u)) for u in apps}
+    prefixes = [state_prefix(u) for u in apps]
     cutoff = time.time() - COOKIE_DAYS * 86400
     removed = 0
+    per_app = {}
     for name in os.listdir(STATE_DIR):
         p = os.path.join(STATE_DIR, name)
         try:
             st = os.stat(p)
-            if name not in keep or st.st_mtime < cutoff or st.st_size > MAX_STATE_BYTES or name.endswith(".tmp"):
+            pre = next((x for x in prefixes if name.startswith(x)), None)
+            if pre is None or st.st_mtime < cutoff or st.st_size > MAX_STATE_BYTES or name.endswith(".tmp"):
                 os.remove(p)
                 removed += 1
+            else:
+                per_app.setdefault(pre, []).append((st.st_mtime, p))
         except OSError:
             pass
+    for pre, items in per_app.items():              # proxy badalte rehte hain: har app ki sirf sabse nayi COOKIE_MAX_PER_APP files
+        items.sort(reverse=True)
+        for _, p in items[COOKIE_MAX_PER_APP:]:
+            try:
+                os.remove(p)
+                removed += 1
+            except OSError:
+                pass
     return removed
 
 
@@ -293,6 +314,17 @@ BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0      # visit ke baad 
 IDLE_REASON = "idle ke baad"
 POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 60)                        # proxy se jagane ke liye max wait (sec), phir seedha retry
 POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 380)               # itni RAM (MB) se upar ho to test ruk jata hai
+# ---- khali time me scan: agli visit tak jitna time bacha, utne me proxy test (max POOL_TEST_MAX)
+POOL_IDLE = env_int("POOL_IDLE_SCAN", 1) != 0
+POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 400))                 # ek khali-window me max itne proxy
+POOL_IDLE_EVERY = max(2, env_int("POOL_IDLE_EVERY_MIN", 15)) * 60       # do idle scan ke beech kam se kam itna gap
+POOL_IDLE_MIN_WIN = env_int("POOL_IDLE_MIN_WINDOW_SEC", 90)            # agli visit me itna time ho tabhi scan shuru
+POOL_IDLE_MARGIN = env_int("POOL_IDLE_MARGIN_SEC", 40)                 # agli visit se itna pehle scan band
+POOL_KEEP_AGE = env_int("POOL_KEEP_AGE_MIN", 120) * 60                 # purane achhe proxy itni der pool me rakho
+POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 6000)                   # roz max itne test (bandwidth bachane ke liye)
+POOL_RETEST_SEC = 3600                                                 # ek proxy ko 1 ghante me dobara test nahi
+POOL_LIST_TTL = 1800                                                   # GitHub list 30 min cache (baar-baar download nahi)
+POOL_STATE = {"tested_at": {}, "day": "", "day_n": 0, "list": None, "list_t": 0.0}
 POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
 POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 1) != 0   # pool khali ho to server ke IP se visit
 POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
@@ -414,45 +446,79 @@ def pool_test_one(hp):
     return {"hp": hp, "ms": ms} if ms <= POOL_MAX_MS else None
 
 
-def pool_refresh():
+def pool_refresh(deadline=None):
+    """deadline (time.time() ka number) ho to khali-window scan: us time se pehle ruk jao. None = purana poora scan."""
     from concurrent.futures import ThreadPoolExecutor
     with POOL_LOCK:
         POOL["busy"] = True
     try:
-        ccmap = pool_fetch()
+        t0 = time.time()
+        if POOL_STATE["list"] is None or t0 - POOL_STATE["list_t"] > POOL_LIST_TTL:
+            POOL_STATE["list"] = pool_fetch()
+            POOL_STATE["list_t"] = t0
+        ccmap = POOL_STATE["list"]
         allp = list(ccmap)
         random.shuffle(allp)
-        sample = allp[:POOL_TEST_N]
+        ta = POOL_STATE["tested_at"]
+        fresh = [x for x in allp if ta.get(x, 0) < t0 - POOL_RETEST_SEC]    # jo abhi test nahi hue unhe pehle
+        if not fresh:
+            ta.clear()
+            fresh = allp
+        limit = POOL_TEST_MAX if deadline else POOL_TEST_N
+        today = time.strftime("%Y%m%d", time.gmtime(t0 + TZ_MIN * 60))
+        if POOL_STATE["day"] != today:
+            POOL_STATE["day"], POOL_STATE["day_n"] = today, 0
+        if deadline:
+            limit = min(limit, POOL_DAILY_TESTS - POOL_STATE["day_n"])
+        sample = fresh[:max(0, limit)]
         good = []
         done = 0
-        stopped = False
+        why = ""
+        est = 25.0                                  # ek batch ka andaza (sec), pehle batch ke baad asli number
         for i in range(0, len(sample), POOL_BATCH):
+            if deadline:
+                nxt = STATUS.get("next") or deadline
+                if STATUS["running"] or time.time() + est > min(deadline, nxt - POOL_IDLE_MARGIN):
+                    why = " (agli visit paas aa gayi, yahin roka)"
+                    break
             waited = 0
             while mem_mb() > POOL_MEM_PAUSE and waited < 90:      # RAM zyada hai: thoda ruko, crash se bachao
                 time.sleep(5)
                 waited += 5
             if mem_mb() > POOL_MEM_PAUSE:
-                stopped = True
+                why = " (RAM ki wajah se beech me roka)"
                 log(f"pool: RAM {mem_mb():.0f} MB > {POOL_MEM_PAUSE} MB, test yahin roka ({done}/{len(sample)} ho chuke)")
                 break
             batch = sample[i:i + POOL_BATCH]
+            bt = time.time()
             with ThreadPoolExecutor(max_workers=POOL_WORKERS) as ex:
                 for res in ex.map(pool_test_one, batch):
                     if res:
+                        res["t"] = time.time()
                         good.append(res)
+            est = max(10.0, time.time() - bt)
             done += len(batch)
+            POOL_STATE["day_n"] += len(batch)
+            for x in batch:
+                ta[x] = time.time()
             import gc
             gc.collect()
-        good.sort(key=lambda g: g["ms"])
-        good = good[:POOL_KEEP]
+        # purane achhe proxy (jo bad mark nahi hue aur bahut purane nahi) naye ke saath rakho
+        now = time.time()
         with POOL_LOCK:
-            if good or not stopped:                  # RAM ki wajah se kuch mila hi nahi to purana pool bacha ke rakho
-                POOL["good"] = good
-                POOL["cc"] = {g["hp"]: ccmap.get(g["hp"]) for g in good}
+            have = {g["hp"] for g in good}
+            old = [g for g in POOL["good"] if g["hp"] not in have and now - g.get("t", now) < POOL_KEEP_AGE
+                   and POOL["bad"].get(g["hp"], 0) < now]
+            oldcc = dict(POOL["cc"])
+        merged = sorted(good + old, key=lambda g: g["ms"])[:POOL_KEEP]
+        with POOL_LOCK:
+            POOL["good"] = merged
+            POOL["cc"] = {g["hp"]: (ccmap.get(g["hp"]) or oldcc.get(g["hp"])) for g in merged}
             POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > time.time()}
             POOL["found"], POOL["tested"], POOL["updated"] = len(allp), done, time.time()
-            POOL["note"] = (f"{done} test, {len(good)} chal rahe" + (f", sabse tez {good[0]['ms']} ms" if good else "")
-                            + (" (RAM ki wajah se beech me roka)" if stopped else ""))
+            POOL["note"] = (f"{done} test, {len(good)} naye chale, pool me {len(merged)}"
+                            + (f", sabse tez {merged[0]['ms']} ms" if merged else "") + why
+                            + f" | aaj {POOL_STATE['day_n']}/{POOL_DAILY_TESTS} test")
         msg = f"free proxy pool: {POOL['note']}"
         log(msg)
         log_add({"event": "proxy", "msg": msg})
@@ -469,11 +535,19 @@ def pool_loop():
     last = 0.0
     while True:
         try:
-            browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or time.time() - last > POOL_REFRESH * 3
-            if browser_free and proxy_auto() and STATUS["engine"] != "obscura" and (POOL_EVT.is_set() or time.time() - last > POOL_REFRESH):
-                POOL_EVT.clear()
-                pool_refresh()
-                last = time.time()
+            if proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"]:
+                now = time.time()
+                browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or now - last > POOL_REFRESH * 3
+                forced = POOL_EVT.is_set() or last == 0.0                    # dashboard se "Free auto" ya server start
+                if browser_free and (forced or (not POOL_IDLE and now - last > POOL_REFRESH)):
+                    POOL_EVT.clear()
+                    pool_refresh()
+                    last = time.time()
+                elif POOL_IDLE and not STATUS["running"] and now - last >= POOL_IDLE_EVERY:
+                    nxt = STATUS.get("next")
+                    if nxt and nxt - now >= POOL_IDLE_MIN_WIN:               # agli visit tak khali time hai
+                        pool_refresh(deadline=nxt - POOL_IDLE_MARGIN)
+                        last = time.time()
         except Exception as e:
             log("pool loop error:", type(e).__name__)
         POOL_EVT.wait(timeout=30)
@@ -519,10 +593,10 @@ VIEWPORTS = [(1366, 768), (1536, 864), (1440, 900), (1920, 1080), (1280, 720), (
 # Ek hi fixed Android phone identity — Samsung Galaxy S23 Ultra jaisi.
 # Headless OFF — real visible Chrome window.
 
-ANDROID_VIEWPORT = {"width": 412, "height": 915}   # Galaxy S23 Ultra
+ANDROID_VIEWPORT = {"width": 412, "height": 915}   # Pixel 8
 ANDROID_SCREEN   = {"width": 412, "height": 915}
-ANDROID_MODEL = "SM-S918B"
-ANDROID_VERSION = "13"
+ANDROID_MODEL = "Pixel 8"
+ANDROID_VERSION = "16"
 
 
 def chrome_major():
@@ -537,15 +611,149 @@ def android_ua(model=None, ver=None):
 
 # Alag-alag asli Android phones. Har proxy ko hash se ek fixed phone milta hai (wahi proxy = wahi phone).
 PHONES = [
-    # model, android, (w, h), dpr, cores, ram_gb, gpu_vendor, gpu_renderer
-    ("SM-S918B", "14", (412, 915), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 740"),
-    ("SM-A546E", "14", (412, 915), 2.625, 8, 4, "ARM", "Mali-G68"),
-    ("Pixel 7", "14", (412, 915), 2.625, 8, 8, "ARM", "Mali-G710"),
-    ("Pixel 6a", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G78"),
-    ("CPH2449", "13", (412, 919), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 740"),
-    ("23021RAA2Y", "13", (393, 873), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 619"),
-    ("SM-M346B", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G68"),
-    ("RMX3771", "13", (412, 915), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 642L"),
+    # model, android, (w, h), dpr, cores, ram_gb, gpu_vendor, gpu_renderer, year
+    # w/h, dpr = yesviz.com (CSS viewport) se mile; android = us phone ka aakhri OS (Chrome 124 ke liye 8.0+)
+    ("SM-G950F", "9", (360, 740), 4.0, 8, 4, "ARM", "Mali-G71", 2017),
+    ("SM-G955F", "9", (360, 740), 4.0, 8, 4, "ARM", "Mali-G71", 2017),
+    ("SM-N950F", "9", (414, 846), 3.5, 8, 4, "ARM", "Mali-G71", 2017),
+    ("SM-G611F", "8.1", (412, 732), 2.625, 8, 2, "ARM", "Mali-T830", 2018),
+    ("SM-G960F", "10", (360, 740), 4.0, 8, 4, "ARM", "Mali-G72", 2018),
+    ("SM-G965F", "10", (360, 740), 4.0, 8, 4, "ARM", "Mali-G72", 2018),
+    ("SM-N960F", "10", (414, 846), 3.5, 8, 4, "ARM", "Mali-G72", 2018),
+    ("SM-J400F", "9", (360, 640), 2.0, 8, 2, "ARM", "Mali-T720", 2018),
+    ("SM-J600F", "10", (360, 740), 2.0, 8, 2, "ARM", "Mali-T830", 2018),
+    ("SM-J810F", "9", (360, 740), 2.0, 8, 4, "Qualcomm", "Adreno (TM) 506", 2018),
+    ("SM-J730F", "9", (360, 640), 3.0, 8, 4, "ARM", "Mali-T830", 2017),
+    ("SM-G973F", "12", (360, 760), 4.0, 8, 8, "ARM", "Mali-G76", 2019),
+    ("SM-G975F", "12", (412, 869), 3.5, 8, 8, "ARM", "Mali-G76", 2019),
+    ("SM-N970F", "12", (412, 869), 2.625, 8, 8, "ARM", "Mali-G76", 2019),
+    ("SM-N975F", "12", (412, 869), 3.5, 8, 8, "ARM", "Mali-G76", 2019),
+    ("SM-A305F", "11", (412, 892), 2.625, 8, 4, "ARM", "Mali-G71", 2019),
+    ("SM-A505F", "11", (412, 892), 2.625, 8, 4, "ARM", "Mali-G72", 2019),
+    ("SM-A507FN", "11", (412, 892), 2.625, 8, 4, "ARM", "Mali-G72", 2019),
+    ("SM-A707F", "11", (412, 914), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 612", 2019),
+    ("SM-A515F", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G72", 2020),
+    ("SM-A715F", "13", (412, 914), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 618", 2020),
+    ("SM-A315F", "12", (412, 915), 2.625, 8, 4, "ARM", "Mali-G52", 2020),
+    ("SM-G770F", "12", (412, 914), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 640", 2020),
+    ("SM-G980F", "13", (360, 800), 4.0, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-G985F", "13", (384, 854), 3.75, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-G988B", "13", (412, 915), 3.5, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-G780F", "13", (412, 914), 2.625, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-N980F", "13", (412, 915), 2.625, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-N986B", "13", (412, 883), 3.5, 8, 8, "ARM", "Mali-G77", 2020),
+    ("SM-F700F", "12", (412, 1004), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 640", 2020),
+    ("SM-A325F", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G52", 2021),
+    ("SM-G998B", "14", (384, 854), 3.75, 8, 8, "ARM", "Mali-G78", 2021),
+    ("SM-S911B", "16", (360, 780), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 740", 2023),
+    ("SM-A546E", "16", (412, 892), 2.625, 8, 8, "ARM", "Mali-G68", 2023),
+    ("SM-S921B", "16", (360, 780), 3.0, 8, 8, "Samsung", "Xclipse 940", 2024),
+    ("SM-A556E", "16", (412, 892), 2.625, 8, 8, "Samsung", "Xclipse 530", 2024),
+    ("SM-A356E", "16", (412, 892), 2.625, 8, 8, "ARM", "Mali-G68", 2024),
+    ("SM-S931B", "16", (360, 780), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 830", 2025),
+    ("SM-S936B", "16", (412, 891), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 830", 2025),
+    ("SM-S938B", "16", (412, 891), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 830", 2025),
+    ("SM-S937B", "16", (412, 891), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 830", 2025),
+    ("SM-A366B", "16", (412, 918), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 710", 2025),
+    ("Pixel 2", "11", (412, 732), 2.625, 8, 4, "Qualcomm", "Adreno (TM) 540", 2017),
+    ("Pixel 2 XL", "11", (412, 823), 3.5, 8, 4, "Qualcomm", "Adreno (TM) 540", 2017),
+    ("Pixel 3", "12", (393, 786), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("Pixel 3 XL", "12", (412, 846), 3.5, 8, 4, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("Pixel 3a", "12", (393, 808), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 615", 2019),
+    ("Pixel 3a XL", "12", (412, 823), 2.625, 8, 4, "Qualcomm", "Adreno (TM) 615", 2019),
+    ("Pixel 4", "13", (393, 830), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("Pixel 4 XL", "13", (412, 869), 3.5, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("Pixel 4a", "13", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 618", 2020),
+    ("Pixel 5", "14", (393, 851), 2.75, 8, 8, "Qualcomm", "Adreno (TM) 620", 2020),
+    ("Pixel 6", "16", (412, 915), 2.625, 8, 8, "ARM", "Mali-G78", 2021),
+    ("Pixel 6 Pro", "16", (412, 892), 3.5, 8, 8, "ARM", "Mali-G78", 2021),
+    ("Pixel 6a", "16", (412, 915), 2.625, 8, 4, "ARM", "Mali-G78", 2022),
+    ("Pixel 7", "16", (412, 915), 2.625, 8, 8, "ARM", "Mali-G710", 2022),
+    ("Pixel 7 Pro", "16", (412, 892), 3.5, 8, 8, "ARM", "Mali-G710", 2022),
+    ("Pixel 7a", "16", (412, 915), 2.625, 8, 8, "ARM", "Mali-G710", 2023),
+    ("Pixel 8", "16", (412, 915), 2.625, 8, 8, "ARM", "Mali-G715", 2023),
+    ("Pixel 8 Pro", "16", (448, 997), 3.0, 8, 8, "ARM", "Mali-G715", 2023),
+    ("Pixel 8a", "16", (412, 915), 2.625, 8, 8, "ARM", "Mali-G715", 2024),
+    ("Pixel 9", "16", (360, 808), 3.0, 8, 8, "ARM", "Mali-G715", 2024),
+    ("Pixel 9 Pro", "16", (427, 952), 3.0, 8, 8, "ARM", "Mali-G715", 2024),
+    ("Pixel 9 Pro XL", "16", (448, 997), 3.0, 8, 8, "ARM", "Mali-G715", 2024),
+    ("A5010", "10", (360, 720), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 540", 2017),
+    ("A6003", "11", (412, 869), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("A6013", "11", (412, 892), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("GM1901", "11", (412, 892), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("GM1917", "11", (412, 892), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("HD1903", "12", (412, 914), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("HD1913", "12", (412, 892), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("IN2013", "13", (412, 915), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("IN2023", "13", (412, 906), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("KB2003", "13", (412, 914), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("AC2003", "12", (412, 915), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 620", 2020),
+    ("LE2113", "14", (412, 915), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 660", 2021),
+    ("LE2123", "14", (412, 919), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 660", 2021),
+    ("DN2103", "13", (412, 915), 2.625, 8, 8, "ARM", "Mali-G77", 2021),
+    ("NE2213", "15", (412, 919), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 730", 2022),
+    ("CPH2573", "16", (412, 905), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 750", 2024),
+    ("CPH2663", "15", (360, 924), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 732", 2024),
+    ("CPH2655", "16", (412, 905), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 830", 2025),
+    ("M1803E1A", "10", (393, 817), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("M1805E2A", "9", (393, 816), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 616", 2018),
+    ("M1902F1G", "11", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("M1903F2G", "10", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 616", 2019),
+    ("M1904F3BG", "10", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 616", 2019),
+    ("M1903F11G", "11", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("M1910F4G", "10", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 618", 2019),
+    ("M1901F7G", "10", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 512", 2019),
+    ("M1908C3JG", "11", (393, 851), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 610", 2019),
+    ("M1906G7G", "11", (393, 851), 2.75, 8, 4, "ARM", "Mali-G76", 2019),
+    ("M2001J2G", "13", (393, 851), 2.75, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("M2001J1G", "13", (393, 851), 2.75, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("M2007J3SY", "12", (393, 873), 2.75, 8, 8, "Qualcomm", "Adreno (TM) 650", 2020),
+    ("M2003J15SS", "11", (393, 851), 2.75, 8, 4, "ARM", "Mali-G52", 2020),
+    ("M2003J6B2G", "12", (393, 873), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 618", 2020),
+    ("LG-H870", "8.0", (360, 720), 4.0, 4, 4, "Qualcomm", "Adreno (TM) 530", 2017),
+    ("LM-G710", "10", (360, 780), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("LM-G820", "11", (360, 780), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("LM-G850", "11", (360, 780), 3.0, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("LM-X410", "8.1", (360, 640), 2.0, 4, 2, "Qualcomm", "Adreno (TM) 308", 2018),
+    ("LM-X420", "9", (360, 720), 2.0, 4, 2, "Qualcomm", "Adreno (TM) 308", 2019),
+    ("LM-X520", "9", (360, 760), 2.0, 8, 2, "Imagination Technologies", "PowerVR Rogue GE8320", 2019),
+    ("LM-X440", "9", (360, 760), 2.0, 8, 2, "Imagination Technologies", "PowerVR Rogue GE8320", 2019),
+    ("LM-X120", "9", (320, 640), 1.5, 4, 2, "Qualcomm", "Adreno (TM) 308", 2019),
+    ("LM-Q710", "8.1", (360, 720), 3.0, 8, 2, "Qualcomm", "Adreno (TM) 506", 2018),
+    ("LM-Q720", "9", (360, 720), 3.0, 8, 4, "Qualcomm", "Adreno (TM) 506", 2019),
+    ("LM-Q630", "10", (360, 780), 3.0, 8, 4, "Imagination Technologies", "PowerVR Rogue GE8320", 2020),
+    ("LM-K510", "10", (360, 800), 2.0, 8, 2, "Imagination Technologies", "PowerVR Rogue GE8320", 2020),
+    ("RNE-L21", "8.0", (360, 720), 3.0, 8, 4, "ARM", "Mali-T830", 2017),
+    ("PRA-LX1", "8.0", (360, 640), 3.0, 8, 2, "ARM", "Mali-T830", 2017),
+    ("VKY-L29", "9", (360, 640), 4.0, 8, 4, "ARM", "Mali-G71", 2017),
+    ("BND-L21", "9", (360, 720), 3.0, 8, 4, "ARM", "Mali-T830", 2017),
+    ("LYA-L29", "10", (360, 780), 4.0, 8, 4, "ARM", "Mali-G76", 2018),
+    ("SNE-LX1", "9", (360, 780), 3.0, 8, 4, "ARM", "Mali-G51", 2018),
+    ("CLT-L29", "10", (360, 747), 3.0, 8, 4, "ARM", "Mali-G72", 2018),
+    ("ANE-LX1", "9", (360, 760), 3.0, 8, 4, "ARM", "Mali-T830", 2018),
+    ("JSN-L21", "10", (360, 780), 3.0, 8, 4, "ARM", "Mali-G51", 2018),
+    ("ELE-L29", "10", (360, 780), 3.0, 8, 4, "ARM", "Mali-G76", 2019),
+    ("VOG-L29", "10", (360, 780), 3.0, 8, 8, "ARM", "Mali-G76", 2019),
+    ("MAR-LX1", "10", (360, 771), 3.0, 8, 4, "ARM", "Mali-G51", 2019),
+    ("STK-LX3", "9", (360, 780), 3.0, 8, 4, "ARM", "Mali-G51", 2019),
+    ("STK-L21", "9", (360, 780), 3.0, 8, 4, "ARM", "Mali-G51", 2019),
+    ("STK-LX1", "9", (360, 780), 3.0, 8, 4, "ARM", "Mali-G51", 2019),
+    ("TAS-L29", "10", (360, 780), 3.0, 8, 8, "ARM", "Mali-G76", 2019),
+    ("LIO-L29", "10", (392, 800), 3.0, 8, 8, "ARM", "Mali-G76", 2019),
+    ("ANA-NX9", "10", (360, 780), 3.0, 8, 8, "ARM", "Mali-G76", 2020),
+    ("ELS-NX9", "10", (400, 880), 3.0, 8, 8, "ARM", "Mali-G76", 2020),
+    ("JNY-LX1", "10", (360, 770), 3.0, 8, 4, "ARM", "Mali-G52", 2020),
+    ("J9110", "11", (411, 960), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("J9210", "11", (360, 840), 3.0, 8, 4, "Qualcomm", "Adreno (TM) 640", 2019),
+    ("I4113", "10", (360, 840), 3.0, 8, 2, "Qualcomm", "Adreno (TM) 508", 2019),
+    ("I4213", "10", (360, 840), 3.0, 8, 4, "Qualcomm", "Adreno (TM) 509", 2019),
+    ("I4312", "10", (360, 840), 2.0, 8, 2, "Imagination Technologies", "PowerVR Rogue GE8320", 2020),
+    ("HTC U11", "8.0", (360, 640), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 540", 2017),
+    ("HTC U11+", "9", (360, 720), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 540", 2017),
+    ("HTC U12+", "10", (360, 720), 4.0, 8, 4, "Qualcomm", "Adreno (TM) 630", 2018),
+    ("XT1924-1", "8.1", (360, 720), 2.0, 4, 2, "Qualcomm", "Adreno (TM) 308", 2018),
+    ("XT2045-2", "10", (360, 780), 2.0, 8, 4, "Qualcomm", "Adreno (TM) 610", 2019),
+    ("V2029", "11", (385, 854), 1.875, 8, 4, "Qualcomm", "Adreno (TM) 610", 2020),
 ]
 # country -> (language, timezone). Proxy ka desh pata ho to timezone/language usi se milte hain.
 COUNTRY_LOC = {
@@ -566,19 +774,30 @@ def tz_offset_min(tz):
         return _TZ_STD.get(tz, 330)
 
 
+def pick_phone(h):
+    """Hash se ek fixed phone chuno; naye saal ke phone ka weight zyada (2017 -> 1, 2025 -> 9)."""
+    total = sum(max(1, p[8] - 2016) for p in PHONES)
+    r = h % total
+    for p in PHONES:
+        r -= max(1, p[8] - 2016)
+        if r < 0:
+            return p
+    return PHONES[-1]
+
+
 def get_fingerprint(url, px=None):
     """px (proxy) ho to us proxy ka apna phone + desh ke hisaab se timezone. px None ho to purana Galaxy S23 Ultra."""
     fp = {
         "ua": android_ua(), "platform": "Linux armv8l", "vendor": "Google Inc.",
-        "viewport": ANDROID_VIEWPORT, "screen": ANDROID_SCREEN, "color_depth": 24, "dpr": 3.0,
+        "viewport": ANDROID_VIEWPORT, "screen": ANDROID_SCREEN, "color_depth": 24, "dpr": 2.625,
         "hardware_concurrency": 8, "device_memory": 8, "language": "en-IN", "timezone_id": "Asia/Kolkata",
         "timezone_offset": 330, "battery_level": 0.82, "battery_charging": False, "touch": True, "seed": FP_SEED,
-        "model": ANDROID_MODEL, "android": ANDROID_VERSION, "gpu_vendor": "Qualcomm", "gpu_renderer": "Adreno (TM) 740",
+        "model": ANDROID_MODEL, "android": ANDROID_VERSION, "gpu_vendor": "ARM", "gpu_renderer": "Mali-G715",
     }
     if not px:
         return fp
     h = int(hashlib.sha1(("fp|" + px).encode()).hexdigest(), 16)
-    model, ver, (w, hh), dpr, cores, ram, gv, gr = PHONES[h % len(PHONES)]
+    model, ver, (w, hh), dpr, cores, ram, gv, gr, _yr = pick_phone(h)
     lang, tz = COUNTRY_LOC.get(pool_country(px) or "IN", COUNTRY_LOC["IN"])
     fp.update({
         "ua": android_ua(model, ver), "viewport": {"width": w, "height": hh}, "screen": {"width": w, "height": hh},
@@ -1087,8 +1306,8 @@ def human_dwell(page, url, obs, touch):
 
 
 def visit(browser, url, direct=False):
-    sp = state_path(url)
     px = pool_pick() if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else None
+    sp = state_path(url, px)                            # is proxy IP ki apni cookie file
     wake_max = POOL_WAKE_MAX if px else WAKE_MAX        # kharab/dheemi proxy par 150 sec barbaad na ho
     fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
     vp = fp["viewport"]                                 # hamesha phone ka size (is_mobile ke saath desktop size mismatch hota)
@@ -1249,7 +1468,8 @@ def visit(browser, url, direct=False):
     was_asleep = not (first and first[0] and first[0] < 400 and not first[1])
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
            "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage,
-           "via": (LAST_PX["hp"] or "seedha"), "phone": fp.get("model")}
+           "via": (LAST_PX["hp"] or "seedha"), "phone": fp.get("model"),
+           "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android")}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
                  f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage} "
                  f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}]")
@@ -1635,16 +1855,19 @@ def dashboard():
         if "event" in e:
             if e["event"] == "round":
                 g = e.get("gap")
-                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="5" class="mut">--- round, {e.get("apps")} apps'
+                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="7" class="mut">--- round, {e.get("apps")} apps'
                                 + (f", pichhle se {g//60}m{g%60}s" if g else "") + "</td></tr>")
             else:
-                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="5" class="bad">{esc(e.get("msg", e["event"]))}</td></tr>')
+                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="7" class="bad">{esc(e.get("msg", e["event"]))}</td></tr>')
             continue
         log_rows.append(
             f'<tr><td>{fmt_t(e["t"])}</td><td>{esc(e["url"].replace("https://", "").replace("http://", ""))}</td>'
             f'<td class="{"ok" if e.get("ok") else "bad"}">{esc(e.get("status"))}{" " + esc(e["gate"]) if e.get("gate") else ""}</td>'
             f'<td>{"SO RAHA THA" if e.get("was_asleep") else "jaaga tha"}</td><td>{e.get("took")}s</td>'
-            f'<td>{"cookies" if e.get("cookies") else "nayi"}</td></tr>')
+            f'<td>{"cookies" if e.get("cookies") else "nayi"}</td>'
+            f'<td>{esc(mask_proxy(e.get("via")).replace("http://", "").replace("https://", "") if e.get("via") not in (None, "seedha") else "seedha (server IP)")}'
+            f'{" [" + esc(e["cc"]) + "]" if e.get("cc") else ""}</td>'
+            f'<td>{esc(e.get("phone") or "-")}{" / A" + esc(e["android"]) if e.get("android") else ""}</td></tr>')
     nxt = STATUS.get("next")
     nxt_s = "abhi chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec me" if nxt else "-")
     up = int(now - STATUS["started"])
@@ -1704,7 +1927,7 @@ Naya proxy agli visit se pehle browser restart karke lagega.</div>
 <form method="post" action="/run" style="margin-top:8px"><button class="grey">Abhi visit karo</button></form></div>
 {proxy_card}
 <div class="card"><h2 style="margin-top:0">Log (pichhle {LOG_DAYS} din, naya upar)</h2>
-<table><tr><th>Time</th><th>App</th><th>Status</th><th>Visit se pehle</th><th>Laga</th><th>Browser</th></tr>{''.join(log_rows) or '<tr><td colspan=6 class="mut">Abhi log khali hai.</td></tr>'}</table>
+<table><tr><th>Time</th><th>App</th><th>Status</th><th>Visit se pehle</th><th>Laga</th><th>Browser</th><th>Proxy</th><th>Phone</th></tr>{''.join(log_rows) or '<tr><td colspan=8 class="mut">Abhi log khali hai.</td></tr>'}</table>
 <div class="mut" style="margin-top:8px"><a href="/log.txt">log download</a></div></div>
 <div class="mut">Dhyan: Render free ka disk restart/redeploy par saaf ho jata hai. Tab apps list <code>APP_URLS</code> se wapas banegi aur log khali hoga.</div>
 </body></html>"""
@@ -1787,10 +2010,13 @@ class H(BaseHTTPRequestHandler):
                 if val in apps:
                     apps.remove(val)
                     save_apps(apps)
-                    try:
-                        os.remove(state_path(val))
-                    except OSError:
-                        pass
+                    pre = state_prefix(val)
+                    for fn in os.listdir(STATE_DIR):
+                        if fn.startswith(pre):
+                            try:
+                                os.remove(os.path.join(STATE_DIR, fn))
+                            except OSError:
+                                pass
             elif path == "/run":
                 TRIGGER.set()
             elif path == "/proxy":
