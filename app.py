@@ -4,7 +4,7 @@
 Dashboard: "/" (password), apps add/delete, 3-din ka log. "/ping" public (uptime bot ke liye).
 Cookies har app ke liye disk par save hoti hain aur purani apne-aap delete.
 """
-import os, sys, time, json, random, threading, urllib.request, html, hmac, base64, hashlib, secrets
+import os, re, sys, time, json, random, threading, urllib.request, html, hmac, base64, hashlib, secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -53,16 +53,20 @@ LOG_FILE = os.path.join(DATA, "log.jsonl")
 CHROME = os.environ.get("CHROME_PATH", "/usr/bin/chromium")
 PORT = env_int("PORT", 10000)
 SELF = os.environ.get("RENDER_EXTERNAL_URL", "")
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()   # env se default
+PROXY_FILE = os.path.join(DATA, "proxy.txt")           # dashboard se set hoga yahan
+# Headed Chrome sirf tab jab DISPLAY (Xvfb) ho; warna headless. HEADED=0 se zabardasti headless.
+HEADED = bool(os.environ.get("DISPLAY")) and env_int("HEADED", 1) != 0
+FP_SEED = env_int("FP_SEED", 0x5EED1234)               # canvas/audio noise ka seed (stable rahega)
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASSWORD", "")
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/124.0.0.0 Safari/537.36")
 
 LOCK = threading.RLock()
 TRIGGER = threading.Event()
+RESTART = {}   # {"why": "..."} -> dusre thread (dashboard) sirf flag rakhta hai, browser main loop restart karta hai
 STATUS = {"started": time.time(), "next": None, "running": False, "b_started": None, "restarts": 0,
-          "last_restart": "-", "mem_now": 0.0, "mem_peak": 0.0, "engine": "chromium"}
+          "last_restart": "-", "mem_now": 0.0, "mem_peak": 0.0, "engine": "chromium",
+          "chrome_full": "124.0.6367.60"}   # asli Chromium ka version (launch par update hota hai)
 OBS = {"proc": None, "failed": False}
 PW = None
 BROWSER = None
@@ -184,11 +188,76 @@ def prune_state(apps):
 
 
 # ---------------------------------------------------------------- proxy (optional)
+PROXY_OFF = "off"   # proxy.txt me ye likha ho to env wala PROXY_URL bhi ignore (dashboard se "Band karo")
+
+
+def get_proxy_url():
+    """Runtime proxy URL: pehle file (dashboard se set), phir env. File me PROXY_OFF ho to koi proxy nahi."""
+    try:
+        with open(PROXY_FILE) as f:
+            v = f.read().strip()
+            if v == PROXY_OFF:
+                return ""
+            if v:
+                return v
+    except OSError:
+        pass
+    return PROXY_URL   # env wala fallback
+
+
+def check_proxy(url):
+    """Proxy URL theek ho to saaf karke wapas, warna None."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "://" not in url:
+        url = "http://" + url
+    try:
+        u = urlparse(url)
+        port = u.port
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https", "socks5") or not u.hostname or not port:
+        return None
+    if u.scheme == "socks5" and (u.username or u.password):
+        return None   # Chromium socks5 par login support nahi karta
+    return url
+
+
+def mask_proxy(url):
+    """Password kabhi dashboard/log me na dikhe: scheme://***@host:port"""
+    if not url:
+        return ""
+    try:
+        u = urlparse(url if "://" in url else "http://" + url)
+        host = u.hostname or "?"
+        if u.port:
+            host += f":{u.port}"
+        return f"{u.scheme}://{'***@' if (u.username or u.password) else ''}{host}"
+    except ValueError:
+        return "(invalid)"
+
+
+def save_proxy_url(url):
+    """Dashboard se set karo. url khali ho to proxy band (PROXY_OFF likhte hain, taaki env ka PROXY_URL bhi na lage)."""
+    os.makedirs(DATA, exist_ok=True)
+    tmp = PROXY_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # password wali file sirf hamare liye
+    with os.fdopen(fd, "w") as f:
+        f.write(url.strip() or PROXY_OFF)
+    os.replace(tmp, PROXY_FILE)
+
+
 def proxy_cfg():
-    if not PROXY_URL:
+    raw = get_proxy_url()
+    if not raw:
+        return None
+    url = check_proxy(raw)
+    if not url:
+        log("proxy URL galat hai, proxy ke bina chal raha hoon:", mask_proxy(raw))
         return None
     from urllib.parse import unquote
-    u = urlparse(PROXY_URL if "://" in PROXY_URL else "http://" + PROXY_URL)
+    u = urlparse(url)
     cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
     if u.username:
         cfg["username"] = unquote(u.username)
@@ -196,15 +265,424 @@ def proxy_cfg():
     return cfg
 
 
+def scrub_proxy_log():
+    """Purani log entries me agar proxy ka password likha ho to hata do (ek baar, start par)."""
+    with LOCK:
+        entries = log_read()
+        if not any(e.get("event") == "proxy" and "@" in str(e.get("msg", "")) for e in entries):
+            return
+        tmp = LOG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            for e in entries:
+                if e.get("event") == "proxy":
+                    e["msg"] = "proxy badla (purani entry, password hata diya)"
+                f.write(json.dumps(e) + "\n")
+        os.replace(tmp, LOG_FILE)
+
+
 # ---------------------------------------------------------------- visiting
-def human_wiggle(page):
-    page.mouse.move(random.randint(80, 1200), random.randint(80, 650), steps=random.randint(8, 20))
-    if random.random() < 0.5:
-        page.mouse.wheel(0, random.randint(-200, 400))
-
-
 # ---- insaan-jaisa behaviour -------------------------------------------------
 VIEWPORTS = [(1366, 768), (1536, 864), (1440, 900), (1920, 1080), (1280, 720), (1600, 900), (1280, 800)]
+
+# ---- Android Phone Fingerprint (sab apps k liye same) ----------------------
+# Ek hi fixed Android phone identity — Samsung Galaxy S23 Ultra jaisi.
+# Headless OFF — real visible Chrome window.
+
+ANDROID_VIEWPORT = {"width": 412, "height": 915}   # Galaxy S23 Ultra
+ANDROID_SCREEN   = {"width": 412, "height": 915}
+ANDROID_MODEL = "SM-S918B"
+ANDROID_VERSION = "13"
+
+
+def chrome_major():
+    return int(STATUS["chrome_full"].split(".")[0])
+
+
+def android_ua():
+    """UA asli Chromium ke major version se banti hai (Android Chrome 'major.0.0.0' likhta hai)."""
+    return (f"Mozilla/5.0 (Linux; Android {ANDROID_VERSION}; {ANDROID_MODEL}) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{chrome_major()}.0.0.0 Mobile Safari/537.36")
+
+
+def get_fingerprint(url):
+    """Sab apps k liye same Android phone fingerprint."""
+    return {
+        "ua": android_ua(),
+        "platform": "Linux armv8l",
+        "vendor": "Google Inc.",
+        "viewport": ANDROID_VIEWPORT,
+        "screen": ANDROID_SCREEN,
+        "color_depth": 24,
+        "dpr": 3.0,
+        "hardware_concurrency": 8,
+        "device_memory": 8,
+        "language": "en-IN",
+        "timezone_id": "Asia/Kolkata",
+        "timezone_offset": 330,
+        "battery_level": 0.82,
+        "battery_charging": False,
+        "touch": True,
+        "seed": FP_SEED,
+    }
+
+
+def ua_override(fp, native_brands):
+    """CDP Emulation.setUserAgentOverride ka payload: UA + Client Hints (headers aur navigator.userAgentData dono).
+
+    native_brands = engine ki apni brands list (usme us version ka asli GREASE brand hota hai).
+    Hum usme "Google Chrome" jodte hain aur full version asli Chromium ka rakhte hain, taaki UA se match kare.
+    """
+    major, full = str(chrome_major()), STATUS["chrome_full"]
+    brands, fulls = [], []
+    for b in native_brands or []:
+        name, ver = str(b.get("brand", "")), str(b.get("version", ""))
+        if name and ver:
+            brands.append({"brand": name, "version": ver})
+            fulls.append({"brand": name, "version": full if name in ("Chromium", "Google Chrome") else ver + ".0.0.0"})
+    if not any(b["brand"] == "Chromium" for b in brands):          # native list na mile to fallback
+        brands = [{"brand": "Chromium", "version": major}, {"brand": "Not?A_Brand", "version": "8"}]
+        fulls = [{"brand": "Chromium", "version": full}, {"brand": "Not?A_Brand", "version": "8.0.0.0"}]
+    if not any(b["brand"] == "Google Chrome" for b in brands):
+        brands.append({"brand": "Google Chrome", "version": major})
+        fulls.append({"brand": "Google Chrome", "version": full})
+    return {
+        "userAgent": fp["ua"],
+        "acceptLanguage": f"{fp['language']},en;q=0.9",            # navigator.languages se match
+        "platform": fp["platform"],
+        "userAgentMetadata": {
+            "brands": brands, "fullVersionList": fulls, "fullVersion": full,
+            "platform": "Android", "platformVersion": f"{ANDROID_VERSION}.0.0",
+            "architecture": "", "bitness": "", "model": ANDROID_MODEL,   # Android Chrome in dono ko khali rakhta hai
+            "mobile": True, "wow64": False,
+        },
+    }
+
+
+# __FP__ ki jagah fingerprint JSON .replace() se bharta hai (% formatting nahi, taaki JS me % chal sake).
+# Jo cheezein Chromium has_touch/is_mobile se khud sahi deta hai (touch events, pointer:coarse, hover:none,
+# userAgentData) unhe yahan fake NAHI karte; patch utna kam jitna zaroori.
+_FP_INIT_SCRIPT = """
+(function(fp){
+
+  // seeded PRNG: same seed => hamesha same sequence (noise stable rehta hai, har call par badalta nahi)
+  const _rng = function(seed) {
+    let a = seed >>> 0;
+    return function() {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  // ── 1. Navigator basic ──────────────────────────────────────────────────
+  try { Object.defineProperty(navigator, 'platform',   {get:()=>fp.platform,   configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'vendor',     {get:()=>fp.vendor,     configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get:()=>fp.hardware_concurrency, configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'deviceMemory', {get:()=>fp.device_memory, configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'language',  {get:()=>fp.language,   configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'languages', {get:()=>[fp.language,'en'], configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'webdriver', {get:()=>undefined,       configurable:true}); } catch(e){}
+  try { Object.defineProperty(navigator, 'maxTouchPoints', {get:()=>5,          configurable:true}); } catch(e){}
+  // appVersion yahan nahi: Chromium use UA se khud banata hai (UA override ke baad sahi aata hai)
+
+  // ── 2. Screen ───────────────────────────────────────────────────────────
+  try { Object.defineProperty(screen, 'width',      {get:()=>fp.screen.width,  configurable:true}); } catch(e){}
+  try { Object.defineProperty(screen, 'height',     {get:()=>fp.screen.height, configurable:true}); } catch(e){}
+  try { Object.defineProperty(screen, 'availWidth', {get:()=>fp.screen.width,  configurable:true}); } catch(e){}
+  try { Object.defineProperty(screen, 'availHeight',{get:()=>fp.screen.height - 48, configurable:true}); } catch(e){}
+  try { Object.defineProperty(screen, 'colorDepth', {get:()=>fp.color_depth,   configurable:true}); } catch(e){}
+  try { Object.defineProperty(screen, 'pixelDepth', {get:()=>fp.color_depth,   configurable:true}); } catch(e){}
+  try { Object.defineProperty(window, 'devicePixelRatio', {get:()=>fp.dpr,     configurable:true}); } catch(e){}
+
+  // ── 3. Touch: patch nahi. Context has_touch=True se ontouchstart/TouchEvent/pointer:coarse native aate hain ──
+
+  // ── 4. Battery API ──────────────────────────────────────────────────────
+  try {
+    navigator.getBattery = function() {
+      return Promise.resolve({
+        charging: fp.battery_charging,
+        chargingTime: Infinity,
+        dischargingTime: 14400,
+        level: fp.battery_level,
+        addEventListener: function(){},
+        removeEventListener: function(){}
+      });
+    };
+  } catch(e){}
+
+  // ── 5. Timezone ─────────────────────────────────────────────────────────
+  try { Date.prototype.getTimezoneOffset = function() { return -330; }; } catch(e){}
+
+  // ── 6. WebGL — Adreno 740 (Galaxy S23 Ultra) spoof ─────────────────────
+  const _getCtx = HTMLCanvasElement.prototype.getContext;
+  try {
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+      const ctx = _getCtx.call(this, type, attrs);
+      if (!ctx) return ctx;
+      if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+        const _getPar = ctx.getParameter.bind(ctx);
+        ctx.getParameter = function(p) {
+          // UNMASKED_VENDOR_WEBGL
+          if (p === 37445) return 'Qualcomm';
+          // UNMASKED_RENDERER_WEBGL
+          if (p === 37446) return 'Adreno (TM) 740';
+          // MAX_TEXTURE_SIZE
+          if (p === 3379)  return 16384;
+          // MAX_RENDERBUFFER_SIZE
+          if (p === 34024) return 16384;
+          // SHADING_LANGUAGE_VERSION
+          if (p === 35724) return 'OpenGL ES GLSL ES 3.20';
+          // VERSION
+          if (p === 7938)  return 'OpenGL ES 3.2 V@0615.73';
+          return _getPar(p);
+        };
+        const _getExt = ctx.getExtension.bind(ctx);
+        ctx.getExtension = function(name) {
+          if (name === 'WEBGL_debug_renderer_info') {
+            return { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
+          }
+          return _getExt(name);
+        };
+      }
+      return ctx;
+    };
+  } catch(e){}
+
+  // ── 7. Canvas fingerprint — stable noise, asli canvas ko chhue bina ─────
+  // Noise ek COPY par lagta hai, original canvas same rehta hai, aur seed fixed hai:
+  // same drawing => hamesha same output (pehle har call par noise badhta tha, fingerprint har baar badalta tha).
+  try {
+    const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const _toBlob = HTMLCanvasElement.prototype.toBlob;
+    const _gid = CanvasRenderingContext2D.prototype.getImageData;
+    const noisyCopy = function(src) {
+      const w = src.width, h = src.height;
+      if (!w || !h || w * h > 4000000) return null;
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const x = c.getContext('2d');
+      x.drawImage(src, 0, 0);
+      const img = _gid.call(x, 0, 0, w, h);          // tainted canvas par yahin SecurityError aayega
+      const d = img.data;
+      const r = _rng((fp.seed ^ Math.imul(w, 73856093) ^ Math.imul(h, 19349663)) >>> 0);
+      for (let i = 0; i < d.length; i += 4 * (40 + Math.floor(r() * 60))) {
+        d[i + Math.floor(r() * 3)] ^= 1;               // sirf 1 LSB, kuch hi pixels
+      }
+      x.putImageData(img, 0, 0);
+      return c;
+    };
+    HTMLCanvasElement.prototype.toDataURL = function(type, q) {
+      let c = null;
+      try { c = noisyCopy(this); } catch (e) {}
+      return _toDataURL.call(c || this, type, q);
+    };
+    if (_toBlob) {
+      HTMLCanvasElement.prototype.toBlob = function(cb, type, q) {
+        let c = null;
+        try { c = noisyCopy(this); } catch (e) {}
+        return _toBlob.call(c || this, cb, type, q);
+      };
+    }
+  } catch(e){}
+
+  // ── 8. Audio fingerprint — AudioBuffer / Analyser me stable, bahut chhota noise ──
+  try {
+    const done = new WeakMap();                        // buffer -> {channel: true}: noise sirf ek baar lagta hai
+    const _gcd = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function(ch) {
+      const d = _gcd.call(this, ch);
+      let m = done.get(this);
+      if (!m) { m = {}; done.set(this, m); }
+      if (!m[ch] && d.length > 0) {
+        m[ch] = true;
+        const r = _rng((fp.seed ^ Math.imul(ch + 1, 2654435761)) >>> 0);
+        for (let i = 0; i < d.length; i += 100 + Math.floor(r() * 50)) {
+          d[i] += (r() - 0.5) * 2e-7;                  // sunai nahi deta, hash badal jata hai
+        }
+      }
+      return d;
+    };
+    const _cfc = AudioBuffer.prototype.copyFromChannel;
+    AudioBuffer.prototype.copyFromChannel = function(dest, ch, off) {
+      this.getChannelData(ch);                         // pehle noise lagao, taaki dono tareeke ek jaisa data dein
+      return _cfc.call(this, dest, ch, off === undefined ? 0 : off);
+    };
+    const _gffd = AnalyserNode.prototype.getFloatFrequencyData;
+    AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+      _gffd.call(this, arr);
+      const r = _rng((fp.seed ^ 0xA5A5) >>> 0);        // har call par reseed => same input, same output
+      for (let i = 0; i < arr.length; i++) arr[i] += (r() - 0.5) * 1e-3;
+    };
+  } catch(e){}
+
+  // ── 9. Sensors — Android motion/orientation events ──────────────────────
+  try {
+    // DeviceMotionEvent — Android phone hamesha thoda hilta rehta hai
+    if (window.DeviceMotionEvent) {
+      let _motTick = 0;
+      setInterval(function() {
+        _motTick++;
+        const noise = function(base, amp) { return base + (Math.random() - 0.5) * amp; };
+        const ev = new DeviceMotionEvent('devicemotion', {
+          acceleration: {x: noise(0, 0.04), y: noise(0, 0.04), z: noise(0, 0.04)},
+          accelerationIncludingGravity: {x: noise(0.1, 0.05), y: noise(0.15, 0.05), z: noise(-9.78, 0.08)},
+          rotationRate: {alpha: noise(0, 0.2), beta: noise(0, 0.2), gamma: noise(0, 0.2)},
+          interval: 16
+        });
+        window.dispatchEvent(ev);
+      }, 500 + Math.random() * 200);
+    }
+    // DeviceOrientationEvent — table par rakha phone
+    if (window.DeviceOrientationEvent) {
+      setInterval(function() {
+        const ev = new DeviceOrientationEvent('deviceorientation', {
+          alpha: 0 + (Math.random() - 0.5) * 2,
+          beta:  2 + (Math.random() - 0.5) * 1,
+          gamma: 0 + (Math.random() - 0.5) * 1,
+          absolute: false
+        });
+        window.dispatchEvent(ev);
+      }, 800 + Math.random() * 400);
+    }
+  } catch(e){}
+
+  // ── 10. Fonts: JS me fake nahi. Asli fonts Dockerfile me install hain (fonts-roboto, fonts-noto-core) ──
+
+  // ── 11. WebRTC — local IP leak band karo ────────────────────────────────
+  try {
+    const _RTCPeer = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if (_RTCPeer) {
+      const _Patched = function(cfg, opts) {
+        // ICE servers hata do — local IP gather nahi hogi
+        const safeCfg = cfg ? Object.assign({}, cfg, {iceServers: []}) : {iceServers: []};
+        const pc = new _RTCPeer(safeCfg, opts);
+        const _createDataChannel = pc.createDataChannel.bind(pc);
+        // onicecandidate patch — koi local IP candidate pass nahi hone dete
+        const _origAddEL = pc.addEventListener.bind(pc);
+        pc.addEventListener = function(type, handler, opts2) {
+          if (type === 'icecandidate') {
+            return _origAddEL(type, function(e) {
+              if (e.candidate && e.candidate.candidate &&
+                  (e.candidate.candidate.indexOf('192.168') !== -1 ||
+                   e.candidate.candidate.indexOf('10.') !== -1 ||
+                   e.candidate.candidate.indexOf('172.') !== -1)) {
+                return; // local IP wale candidates drop karo
+              }
+              handler(e);
+            }, opts2);
+          }
+          return _origAddEL(type, handler, opts2);
+        };
+        return pc;
+      };
+      try {
+        _Patched.prototype = _RTCPeer.prototype;
+        if (window.RTCPeerConnection) window.RTCPeerConnection = _Patched;
+        if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = _Patched;
+      } catch(e){}
+    }
+  } catch(e){}
+
+  // ── 12. Network Connection — WiFi Android jaisa ──────────────────────────
+  try {
+    const conn = {
+      effectiveType: '4g',
+      type: 'wifi',
+      downlink: 18.5,
+      downlinkMax: Infinity,
+      rtt: 65,
+      saveData: false,
+      onchange: null,
+      addEventListener: function(){},
+      removeEventListener: function(){}
+    };
+    Object.defineProperty(navigator, 'connection',       {get:()=>conn, configurable:true});
+    Object.defineProperty(navigator, 'mozConnection',    {get:()=>conn, configurable:true});
+    Object.defineProperty(navigator, 'webkitConnection', {get:()=>conn, configurable:true});
+  } catch(e){}
+
+  // ── 13. Permissions API — Android phone jaisi ────────────────────────────
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const _origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function(desc) {
+        const name = (desc && desc.name) || '';
+        // Android par yeh permissions prompt karti hain (granted nahi, denied bhi nahi)
+        if (['camera','microphone','geolocation','notifications'].indexOf(name) !== -1) {
+          return Promise.resolve({state: 'prompt', onchange: null,
+            addEventListener: function(){}, removeEventListener: function(){}});
+        }
+        // clipboard Android par granted hoti hai
+        if (name === 'clipboard-read' || name === 'clipboard-write') {
+          return Promise.resolve({state: 'granted', onchange: null,
+            addEventListener: function(){}, removeEventListener: function(){}});
+        }
+        return _origQuery(desc);
+      };
+    }
+  } catch(e){}
+
+  // ── 14. Media Devices — front + back camera + mic ────────────────────────
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices = function() {
+        return Promise.resolve([
+          {kind:'videoinput',  label:'',  deviceId:'front001', groupId:'grp1'},
+          {kind:'videoinput',  label:'',  deviceId:'back001',  groupId:'grp2'},
+          {kind:'audioinput',  label:'',  deviceId:'mic001',   groupId:'grp3'},
+          {kind:'audiooutput', label:'',  deviceId:'spk001',   groupId:'grp3'}
+        ]);
+      };
+    }
+  } catch(e){}
+
+  // ── 15. Speech Synthesis — Android TTS voices ────────────────────────────
+  try {
+    if (window.speechSynthesis) {
+      const _fakeVoices = [
+        {voiceURI:'com.google.android.tts', name:'Android Speech Recognition and Synthesis from Google',
+         lang:'en-US', localService:true, default:true},
+        {voiceURI:'com.google.android.tts-hi', name:'Android Hindi TTS',
+         lang:'hi-IN', localService:true, default:false}
+      ];
+      const _origGetVoices = window.speechSynthesis.getVoices.bind(window.speechSynthesis);
+      window.speechSynthesis.getVoices = function() {
+        const real = _origGetVoices();
+        return real.length ? real : _fakeVoices;
+      };
+      // onvoiceschanged fire karo
+      setTimeout(function() {
+        try {
+          const ev = new Event('voiceschanged');
+          window.speechSynthesis.dispatchEvent(ev);
+        } catch(e2){}
+      }, 200);
+    }
+  } catch(e){}
+
+  // ── 16. matchMedia: patch hata diya. Chromium khud pointer:coarse / hover:none deta hai (test se verify) ──
+
+  // ── 17. Clipboard — Android par available ────────────────────────────────
+  try {
+    if (!navigator.clipboard) {
+      Object.defineProperty(navigator, 'clipboard', {
+        get: () => ({
+          readText:  () => Promise.resolve(''),
+          writeText: (t) => Promise.resolve(),
+          read:      () => Promise.resolve([]),
+          write:     () => Promise.resolve()
+        }),
+        configurable: true
+      });
+    }
+  } catch(e){}
+
+})(__FP__);
+"""
+
+
 LEARNED = {}           # app url -> us page ne khud jo same-site GET (xhr/fetch) kiye, wahi hum dohrayenge
 BAD_WORDS = ("logout", "signout", "delete", "remove", "clear", "reset", "stream", "chat/completions", "generate", "send")
 JS_FETCH = """async (u)=>{const c=new AbortController();const t=setTimeout(()=>c.abort(),15000);
@@ -217,49 +695,81 @@ def rwait(page, lo, hi):
     page.wait_for_timeout(int(random.triangular(lo, hi, lo + (hi - lo) * random.random() ** 2) * 1000))
 
 
-def bezier_path(x0, y0, x1, y1):
-    """Seedhi line nahi, curve + halka kaanpna. (x, y) points ki list."""
-    dx, dy = x1 - x0, y1 - y0
-    dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
-    bend = dist * random.uniform(0.08, 0.35)
-    c1 = (x0 + dx * random.uniform(0.15, 0.4) + random.uniform(-bend, bend), y0 + dy * random.uniform(0.15, 0.4) + random.uniform(-bend, bend))
-    c2 = (x0 + dx * random.uniform(0.6, 0.9) + random.uniform(-bend, bend), y0 + dy * random.uniform(0.6, 0.9) + random.uniform(-bend, bend))
-    n = max(10, min(55, int(dist / random.uniform(14, 30))))
-    pts = []
-    for i in range(1, n + 1):
-        t = i / n
-        t = t * t * (3 - 2 * t)                       # shuru/ant me dheema, beech me tez
-        a, b, c, d = (1 - t) ** 3, 3 * (1 - t) ** 2 * t, 3 * (1 - t) * t * t, t ** 3
-        pts.append((a * x0 + b * c1[0] + c * c2[0] + d * x1 + random.uniform(-1.4, 1.4),
-                    a * y0 + b * c1[1] + c * c2[1] + d * y1 + random.uniform(-1.4, 1.4)))
-    return pts
+# Tap sirf aisi jagah jahan koi link/button/input na ho (tap = click; app ka koi action na chal jaye)
+JS_SAFE_TAP = """([x, y]) => {
+  let n = document.elementFromPoint(x, y);
+  if (!n) return false;
+  const bad = 'a,button,input,select,textarea,label,summary,option,video,audio,canvas,iframe,[role],[onclick],[tabindex],[contenteditable]';
+  for (; n && n !== document.documentElement; n = n.parentElement) {
+    if (n.matches && n.matches(bad)) return false;
+    if (getComputedStyle(n).cursor === 'pointer') return false;
+  }
+  return true;
+}"""
 
 
-def h_move(page, pos, vw, vh):
-    x1 = random.uniform(vw * 0.05, vw * 0.95)
-    y1 = random.uniform(vh * 0.08, vh * 0.92)
-    if pos.get("x") is None:
-        pos["x"], pos["y"] = random.uniform(vw * 0.2, vw * 0.8), random.uniform(vh * 0.2, vh * 0.8)
-    for (x, y) in bezier_path(pos["x"], pos["y"], x1, y1):
-        page.mouse.move(max(1, x), max(1, y))
+class Touch:
+    """Asli phone jaisa touch: tap aur swipe (CDP Input.dispatchTouchEvent). Mouse/wheel events nahi bante.
+    cdp None ho (obscura) to purana wheel scroll fallback."""
+
+    def __init__(self, page, cdp, vw, vh):
+        self.page, self.cdp, self.vw, self.vh = page, cdp, vw, vh
+
+    def _ev(self, typ, x=None, y=None, rad=7.0, force=0.5):
+        pts = []
+        if x is not None:
+            pts = [{"x": round(x, 2), "y": round(y, 2), "id": 0,
+                    "radiusX": round(rad + random.uniform(-0.6, 0.6), 2), "radiusY": round(rad + random.uniform(-0.6, 0.6), 2),
+                    "force": round(max(0.05, min(1.0, force + random.uniform(-0.06, 0.06))), 3)}]
+        self.cdp.send("Input.dispatchTouchEvent", {"type": typ, "touchPoints": pts})
+
+    def swipe(self, scroll_down=True):
+        """Ungli upar kheench ke neeche scroll (ya ulta). Halka tedha, beech me tez, ant me dheema."""
+        vw, vh = self.vw, self.vh
+        dist = random.uniform(vh * 0.12, vh * 0.55)
+        if self.cdp is None:
+            self.page.mouse.wheel(0, dist if scroll_down else -dist)
+            return
+        x0 = random.uniform(vw * 0.25, vw * 0.8)
+        y0 = random.uniform(vh * 0.55, vh * 0.85) if scroll_down else random.uniform(vh * 0.2, vh * 0.45)
+        y1 = min(vh * 0.95, max(vh * 0.05, y0 + (-dist if scroll_down else dist)))
+        x1 = x0 + random.uniform(-vw * 0.07, vw * 0.07)
+        n = random.randint(9, 18)
+        step_ms = random.uniform(130, 420) / n
+        rad, force = random.uniform(5.5, 10.0), random.uniform(0.3, 0.65)
+        self._ev("touchStart", x0, y0, rad, force)
+        for i in range(1, n + 1):
+            t = i / n
+            e = t * t * (3 - 2 * t)
+            self.page.wait_for_timeout(max(4, int(step_ms * random.uniform(0.7, 1.3))))
+            self._ev("touchMove", x0 + (x1 - x0) * e + random.uniform(-0.8, 0.8),
+                     y0 + (y1 - y0) * e + random.uniform(-0.8, 0.8), rad, force)
+        self._ev("touchEnd")
+
+    def tap(self):
+        """Safe jagah par ek tap. Jagah na mile to False (kuch nahi hota)."""
+        if self.cdp is None:
+            return False
+        for _ in range(6):
+            x = random.uniform(self.vw * 0.1, self.vw * 0.9)
+            y = random.uniform(self.vh * 0.12, self.vh * 0.88)
+            if not self.page.evaluate(JS_SAFE_TAP, [x, y]):
+                continue
+            rad, force = random.uniform(5.5, 10.0), random.uniform(0.3, 0.65)
+            self._ev("touchStart", x, y, rad, force)
+            self.page.wait_for_timeout(random.randint(45, 130))
+            self._ev("touchEnd")
+            return True
+        return False
+
+
+def h_scroll(touch):
+    down = random.choice([True, True, True, False])
+    for _ in range(random.randint(1, 3)):
+        touch.swipe(down)
+        touch.page.wait_for_timeout(random.randint(400, 1800))
         if random.random() < 0.25:
-            page.wait_for_timeout(random.randint(3, 25))
-    pos["x"], pos["y"] = x1, y1
-    if random.random() < 0.35:                         # kahin ruk ke thoda hilna (hover)
-        for _ in range(random.randint(2, 5)):
-            pos["x"] += random.uniform(-6, 6)
-            pos["y"] += random.uniform(-5, 5)
-            page.mouse.move(max(1, pos["x"]), max(1, pos["y"]), steps=random.randint(1, 3))
-            page.wait_for_timeout(random.randint(40, 260))
-
-
-def h_scroll(page):
-    d = random.choice([1, 1, 1, -1])
-    for _ in range(random.randint(1, 4)):
-        page.mouse.wheel(0, d * random.randint(50, 420))
-        page.wait_for_timeout(random.randint(120, 1300))
-        if random.random() < 0.2:
-            d = -d
+            down = not down
 
 
 def h_inpage_request(page, url):
@@ -273,13 +783,11 @@ def h_inpage_request(page, url):
     return f"{path}:{code}"
 
 
-def human_dwell(page, url, obs):
-    """Chhoti visit: random der rukna, mouse/scroll, aur beech me page ke andar se request."""
+def human_dwell(page, url, obs, touch):
+    """Chhoti visit: random der rukna, touch swipe/tap, aur beech me page ke andar se request."""
     target = random.uniform(DWELL_MIN, DWELL_MAX)
     if random.random() < 0.08:
         target *= random.uniform(1.6, 2.4)             # kabhi kabhi zyada der
-    vw, vh = page.viewport_size["width"], page.viewport_size["height"]
-    pos = {"x": None, "y": None}
     n_req = random.randint(1, INPAGE_MAX) if INPAGE else 0
     req_at = sorted(random.uniform(0.15, 0.9) * target for _ in range(n_req))
     reqs = []
@@ -293,15 +801,16 @@ def human_dwell(page, url, obs):
                 mem_mb()
                 continue
             r = random.random()
-            if r < 0.50:
-                h_move(page, pos, vw, vh)
-            elif r < 0.75:
-                h_scroll(page)
-            elif r < 0.88:
+            if r < 0.55:
+                h_scroll(touch)
+            elif r < 0.68:
+                touch.tap()                            # safe khali jagah par tap (link/button par kabhi nahi)
+            elif r < 0.85:
                 rwait(page, 0.8, 4.5)                  # bas kuch der dekhna
             else:
-                h_move(page, pos, vw, vh)
-                h_scroll(page)
+                h_scroll(touch)
+                rwait(page, 0.5, 2.0)
+                touch.tap()
             rwait(page, 0.2, 2.5)
         while req_at:                                  # request bachi ho to bhej do (har visit me kam se kam 1)
             req_at.pop(0)
@@ -315,9 +824,14 @@ def human_dwell(page, url, obs):
 
 def visit(browser, url):
     sp = state_path(url)
-    vp = random.choice(VIEWPORTS) if HUMAN else (1366, 768)
-    kw = dict(user_agent=UA, viewport={"width": vp[0], "height": vp[1]}, locale="en-US", timezone_id="Asia/Kolkata",
-              java_script_enabled=JS_ON)
+    fp = get_fingerprint(url)                           # per-app stable fingerprint
+    vp = fp["viewport"]                                 # hamesha phone ka size (is_mobile ke saath desktop size mismatch hota)
+    kw = dict(user_agent=fp["ua"], viewport=vp,
+              locale=fp["language"], timezone_id=fp["timezone_id"],
+              extra_http_headers={"Accept-Language": f"{fp['language']},en;q=0.9"},   # navigator.languages se match
+              java_script_enabled=JS_ON,
+              has_touch=True, is_mobile=True,
+              device_scale_factor=fp["dpr"])
     had_cookies = False
     if os.path.exists(sp):
         try:                                  # file sach me kharab ho tabhi hatao (browser crash par nahi)
@@ -340,12 +854,41 @@ def visit(browser, url):
     else:
         ctx = browser.new_context(storage_state=sp, **kw) if had_cookies else browser.new_context(**kw)
     try:
-        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        fp_json = json.dumps({
+            "platform": fp["platform"], "vendor": fp["vendor"],
+            "hardware_concurrency": fp["hardware_concurrency"],
+            "device_memory": fp["device_memory"],
+            "language": fp["language"],
+            "screen": fp["screen"],
+            "color_depth": fp["color_depth"],
+            "dpr": fp["dpr"],
+            "battery_level": fp["battery_level"],
+            "battery_charging": fp["battery_charging"],
+            "timezone_offset": fp["timezone_offset"],
+            "seed": fp["seed"],
+        })
+        ctx.add_init_script(_FP_INIT_SCRIPT.replace("__FP__", fp_json))
     except Exception:
         if not obs:
             raise
     page = ctx.new_page()
-    if not obs:                               # obscura render nahi karta, route ki zaroorat nahi
+    cdp = None
+    if not obs:                               # touch + UA/Client Hints CDP se (obscura me CDP ye sab nahi karta)
+        try:
+            cdp = ctx.new_cdp_session(page)
+        except Exception as e:
+            log("cdp session nahi bana (touch band, wheel fallback):", type(e).__name__)
+        if cdp is not None:
+            try:
+                native = page.evaluate("() => navigator.userAgentData ? navigator.userAgentData.brands : []")
+            except Exception:
+                native = []
+            try:
+                cdp.send("Emulation.setUserAgentOverride", ua_override(fp, native))
+            except Exception as e:
+                log("UA metadata set nahi hua:", type(e).__name__, str(e)[:100])
+    touch = Touch(page, cdp, fp["viewport"]["width"], fp["viewport"]["height"])
+    if not obs:                             # obscura render nahi karta, route ki zaroorat nahi
         page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
     t0, status, gate, first = time.time(), None, None, None
     ok, dwell_done, reloads, inpage = False, 0, 0, []
@@ -405,14 +948,14 @@ def visit(browser, url):
                 seen, last_load = nav["n"], time.time()
                 ok = awake(status, gate)
         if ok and HUMAN:
-            dwell_done, inpage = human_dwell(page, url, obs)
+            dwell_done, inpage = human_dwell(page, url, obs, touch)
         elif ok:
             d0 = time.time()
             while time.time() - d0 < DWELL:         # page par asli insaan jaisa thoda ruko
                 page.wait_for_timeout(random.randint(3000, 7000))
                 mem_mb()
                 try:
-                    human_wiggle(page)
+                    touch.swipe(random.random() < 0.75)
                 except Exception:
                     if not obs:
                         break
@@ -432,7 +975,8 @@ def visit(browser, url):
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
            "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
-                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage}")
+                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage} "
+                 f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}]")
     log_add(res)
     return res
 
@@ -505,8 +1049,9 @@ def start_obscura():
     cmd = [OBSCURA_BIN, "serve", "--port", str(OBSCURA_PORT)]
     if OBSCURA_STEALTH:
         cmd.append("--stealth")
-    if PROXY_URL:
-        cmd += ["--proxy", PROXY_URL]
+    _pu = get_proxy_url()
+    if _pu:
+        cmd += ["--proxy", _pu]
     OBS["proc"] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t0 = time.time()
     while True:
@@ -563,12 +1108,21 @@ def launch_browser(reason):
         kw = {"proxy": pc} if pc else {}
         if pc:
             log("proxy ON:", pc["server"])
-        BROWSER = PW.chromium.launch(executable_path=CHROME, headless=True, timeout=120000, args=[
-            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+        BROWSER = PW.chromium.launch(executable_path=CHROME, headless=not HEADED, timeout=120000, args=[
+            "--no-sandbox", "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
-            "--enable-low-end-device-mode",                 # naap me: bhaari page par peak ~20% kam
-            "--disable-extensions", "--disable-background-networking", "--mute-audio", "--no-first-run"], **kw)
+            "--enable-low-end-device-mode",
+            "--disable-extensions", "--disable-background-networking", "--mute-audio", "--no-first-run",
+            "--window-size=412,915",                        # Android screen size
+            "--force-device-scale-factor=3.0",             # Android DPR
+        ], **kw)
     STATUS["engine"] = engine
+    try:                                   # UA/Client Hints isi asli version se banenge, taaki engine se match kare
+        v = str(BROWSER.version or "")
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", v):
+            STATUS["chrome_full"] = v
+    except Exception:
+        pass
     STATUS["b_started"] = time.time()
     STATUS["restarts"] += 1
     STATUS["last_restart"] = f"{fmt_t(time.time())} - {reason}"
@@ -584,7 +1138,11 @@ def get_browser():
 
 
 def check_health():
-    """Visit se pehle: memory ya umar zyada ho to browser restart."""
+    """Visit se pehle: proxy badla / memory ya umar zyada ho to browser restart (hamesha isi main thread se)."""
+    why = RESTART.pop("why", None)
+    if why:
+        launch_browser(why)
+        return
     if BROWSER is None:
         return
     mb = mem_mb()
@@ -795,6 +1353,23 @@ def dashboard():
                         f"&middot; aakhri: {esc(STATUS['last_restart'])}")
     else:
         browser_line = "abhi shuru nahi hua"
+    cur_proxy = get_proxy_url()
+    proxy_status = (f'<span class="ok">ON</span> &mdash; <code>{esc(mask_proxy(cur_proxy))}</code>'
+                    if cur_proxy else '<span class="mut">Band hai (server ka apna IP use ho raha hai)</span>')
+    proxy_card = f"""
+<div class="card"><h2 style="margin-top:0">Proxy</h2>
+<div style="margin-bottom:8px">Abhi: {proxy_status}</div>
+<form method="post" action="/proxy" style="display:block" autocomplete="off">
+  <input type="text" name="proxy_url" placeholder="naya proxy: http://user:pass@host:port" autocomplete="off">
+  <div style="margin-top:8px;display:flex;gap:8px">
+    <button type="submit" name="act" value="save">Save karo</button>
+    <button type="submit" name="act" value="off" class="red">Band karo</button>
+  </div>
+</form>
+<div class="mut" style="margin-top:8px">Format: <code>http://user:pass@host:port</code> &nbsp;|&nbsp; <code>socks5://host:port</code> (socks5 par login nahi chalta)<br>
+Password yahan kabhi nahi dikhta. Box khali chhod ke Save karoge to kuch nahi badlega.
+Naya proxy agli visit se pehle browser restart karke lagega.</div>
+</div>"""
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Keepalive</title><style>{CSS}</style></head><body>
 <h1>Keepalive dashboard</h1>
@@ -806,6 +1381,7 @@ def dashboard():
 <form method="post" action="/add" style="display:block;margin-top:10px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
 <div style="margin-top:8px"><button>Add karo</button></div></form>
 <form method="post" action="/run" style="margin-top:8px"><button class="grey">Abhi visit karo</button></form></div>
+{proxy_card}
 <div class="card"><h2 style="margin-top:0">Log (pichhle {LOG_DAYS} din, naya upar)</h2>
 <table><tr><th>Time</th><th>App</th><th>Status</th><th>Visit se pehle</th><th>Laga</th><th>Browser</th></tr>{''.join(log_rows) or '<tr><td colspan=6 class="mut">Abhi log khali hai.</td></tr>'}</table>
 <div class="mut" style="margin-top:8px"><a href="/log.txt">log download</a></div></div>
@@ -896,6 +1472,27 @@ class H(BaseHTTPRequestHandler):
                         pass
             elif path == "/run":
                 TRIGGER.set()
+            elif path == "/proxy":
+                act = (form.get("act") or [""])[0]
+                raw = (form.get("proxy_url") or [""])[0].strip()
+                if act == "off":
+                    new_proxy = ""
+                elif raw:
+                    new_proxy = check_proxy(raw)
+                    if not new_proxy:
+                        return self._send(400, "Proxy URL galat. Format: http://user:pass@host:port ya socks5://host:port "
+                                               "(socks5 par user/pass nahi chalta).", "text/plain; charset=utf-8")
+                else:
+                    return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})   # khali Save = kuch nahi
+                try:
+                    save_proxy_url(new_proxy)
+                except Exception as e:
+                    return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
+                shown = mask_proxy(new_proxy) or "band"
+                log("proxy update:", shown)
+                log_add({"event": "proxy", "msg": f"proxy: {shown}"})
+                # Playwright dusre thread se nahi chalta: yahan sirf flag, restart main loop karega
+                RESTART["why"] = f"proxy badla ({shown})"
             else:
                 return self._send(404, "nahi mila", "text/plain; charset=utf-8")
         self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
@@ -910,6 +1507,10 @@ if __name__ == "__main__":
         log(f"ADMIN_PASSWORD set nahi hai. Is baar ka password: {ADMIN_PASS}  (user: {ADMIN_USER}). "
             "Render Environment me ADMIN_PASSWORD daalo.")
     log_add({"event": "start"})
+    try:
+        scrub_proxy_log()
+    except Exception as e:
+        log("proxy log scrub failed:", type(e).__name__)
     threading.Thread(target=loop_human if HUMAN else loop, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
     log("listening on", PORT)

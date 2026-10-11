@@ -1,5 +1,6 @@
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends chromium fonts-liberation curl ca-certificates \
+# fonts-roboto + fonts-noto-core: Android jaise asli fonts (JS se font spoof nahi hota, isliye system me hi rakhe)
+RUN apt-get update && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-roboto fonts-noto-core curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Obscura (halka browser). Download fail ho to build NAHI tootega, app Chromium par chalegi.
