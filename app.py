@@ -21,10 +21,11 @@ SEED = [u.strip() for u in os.environ.get("APP_URLS", "").replace("\n", ",").spl
 EVERY = env_int("EVERY_MIN", 3) * 60          # rounds ke beech gap
 DWELL = env_int("DWELL_SEC", 45)              # jaagne ke baad page par kitni der ruke
 WAKE_MAX = env_int("WAKE_MAX", 150)           # ek app ko jagane ka max wait
+JS_ON = env_int("JS_ENABLED", 1) != 0           # 0 daalo to Chrome me JavaScript band (RAM test)
 WAKE_RELOAD = env_int("WAKE_RELOAD_SEC", 45)    # wake page khud na khule to itne sec baad hi reload (5 sec wala reload band)
 LOG_DAYS = env_int("LOG_DAYS", 3)
 COOKIE_DAYS = env_int("COOKIE_DAYS", 3)
-MEM_LIMIT = env_int("MEM_LIMIT_MB", 400)        # itni memory (MB) par browser restart hoga
+MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser restart hoga
 MAX_HOURS = env_int("BROWSER_MAX_HOURS", 12)    # itne ghante baad browser restart (safety)
 MAX_LOG_LINES = 20000
 MAX_STATE_BYTES = 300 * 1024
@@ -189,7 +190,8 @@ def human_wiggle(page):
 
 def visit(browser, url):
     sp = state_path(url)
-    kw = dict(user_agent=UA, viewport={"width": 1366, "height": 768}, locale="en-US", timezone_id="Asia/Kolkata")
+    kw = dict(user_agent=UA, viewport={"width": 1366, "height": 768}, locale="en-US", timezone_id="Asia/Kolkata",
+              java_script_enabled=JS_ON)
     had_cookies = False
     if os.path.exists(sp):
         try:                                  # file sach me kharab ho tabhi hatao (browser crash par nahi)
@@ -271,7 +273,7 @@ def visit(browser, url):
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
            "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
-                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads}")
+                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'}")
     log_add(res)
     return res
 
