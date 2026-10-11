@@ -1486,6 +1486,7 @@ def human_dwell(page, url, obs, touch):
     reqs = []
     d0 = time.time()
     mem_chk = 0.0
+    STATUS["visit_peak"] = 0.0
     try:
         rwait(page, 1.5, 7.0)                          # page khulte hi koi kuch nahi karta, pehle dekhta hai
         while time.time() - d0 < target:
@@ -1686,7 +1687,8 @@ def visit(browser, url, direct=False):
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
            "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage,
            "via": (LAST_PX["hp"] or "seedha"), "phone": fp.get("model"),
-           "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android")}
+           "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android"),
+           "mem": int(STATUS.get("visit_peak") or 0)}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
                  f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage} "
                  f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}]")
@@ -1736,6 +1738,8 @@ def mem_mb():
                 pass
     mb = tot / 1024
     STATUS["mem_now"] = mb
+    if mb > STATUS.get("visit_peak", 0):
+        STATUS["visit_peak"] = mb
     if mb > STATUS["mem_peak"]:
         STATUS["mem_peak"] = mb
     return mb
@@ -1826,7 +1830,10 @@ def launch_browser(reason):
             "--disable-blink-features=AutomationControlled",
             "--enable-low-end-device-mode",
             "--renderer-process-limit=1",                   # RAM: bahut saare renderer process nahi
-            "--disable-features=site-per-process,IsolateOrigins,Translate",
+            "--disable-features=site-per-process,IsolateOrigins,Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,AudioServiceOutOfProcess,InterestFeedContentSuggestions",
+            "--no-zygote", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--disable-breakpad",
+            "--disable-domain-reliability", "--disable-client-side-phishing-detection", "--metrics-recording-only",
+            "--disable-gpu-shader-disk-cache", "--disable-hang-monitor", "--disable-renderer-backgrounding",
             "--disable-site-isolation-trials",
             "--disk-cache-size=1", "--media-cache-size=1", "--disable-software-rasterizer",
             "--js-flags=--max-old-space-size=128",          # JS heap par limit
@@ -2120,7 +2127,8 @@ def dashboard():
             f'{"so raha tha" if e.get("was_asleep") else "jaaga tha"} &middot; {e.get("took")}s<br>'
             f'<span class="mu">{via_s}{" [" + esc(e["cc"]) + "]" if e.get("cc") else ""} &middot; '
             f'{esc(e.get("phone") or "-")}{" A" + esc(e["android"]) if e.get("android") else ""} &middot; '
-            f'{"cookies" if e.get("cookies") else "nayi"}</span></div>')
+            f'{"cookies" if e.get("cookies") else "nayi"}'
+            f'{" &middot; RAM " + str(e["mem"]) + " MB" if e.get("mem") else ""}</span></div>')
     # ---- status header
     nxt = STATUS.get("next")
     nxt_s = "abhi chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec me" if nxt else "-")
