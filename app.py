@@ -21,6 +21,10 @@ SEED = [u.strip() for u in os.environ.get("APP_URLS", "").replace("\n", ",").spl
 EVERY = env_int("EVERY_MIN", 3) * 60          # rounds ke beech gap
 DWELL = env_int("DWELL_SEC", 45)              # jaagne ke baad page par kitni der ruke
 WAKE_MAX = env_int("WAKE_MAX", 150)           # ek app ko jagane ka max wait
+ENGINE_WANT = os.environ.get("BROWSER_ENGINE", "chromium").strip().lower()   # "chromium" ya "obscura"
+OBSCURA_BIN = os.environ.get("OBSCURA_PATH", "/usr/local/bin/obscura")
+OBSCURA_PORT = env_int("OBSCURA_PORT", 9222)
+OBSCURA_STEALTH = env_int("OBSCURA_STEALTH", 1) != 0
 JS_ON = env_int("JS_ENABLED", 1) != 0           # 0 daalo to Chrome me JavaScript band (RAM test)
 WAKE_RELOAD = env_int("WAKE_RELOAD_SEC", 45)    # wake page khud na khule to itne sec baad hi reload (5 sec wala reload band)
 LOG_DAYS = env_int("LOG_DAYS", 3)
@@ -48,7 +52,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 LOCK = threading.RLock()
 TRIGGER = threading.Event()
 STATUS = {"started": time.time(), "next": None, "running": False, "b_started": None, "restarts": 0,
-          "last_restart": "-", "mem_now": 0.0, "mem_peak": 0.0}
+          "last_restart": "-", "mem_now": 0.0, "mem_peak": 0.0, "engine": "chromium"}
+OBS = {"proc": None, "failed": False}
 PW = None
 BROWSER = None
 
@@ -203,10 +208,24 @@ def visit(browser, url):
                 os.remove(sp)
             except OSError:
                 pass
-    ctx = browser.new_context(storage_state=sp, **kw) if had_cookies else browser.new_context(**kw)
-    ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    obs = STATUS["engine"] == "obscura"
+    if obs and had_cookies:
+        try:
+            ctx = browser.new_context(storage_state=sp, **kw)
+        except Exception as e:
+            log("obscura: cookies load nahi hui, bina cookies:", type(e).__name__)
+            had_cookies = False
+            ctx = browser.new_context(**kw)
+    else:
+        ctx = browser.new_context(storage_state=sp, **kw) if had_cookies else browser.new_context(**kw)
+    try:
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    except Exception:
+        if not obs:
+            raise
     page = ctx.new_page()
-    page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
+    if not obs:                               # obscura render nahi karta, route ki zaroorat nahi
+        page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
     t0, status, gate, first = time.time(), None, None, None
     ok, dwell_done, reloads = False, 0, 0
     nav = {"status": None, "gate": None, "n": 0}
@@ -256,7 +275,8 @@ def visit(browser, url):
                 try:
                     human_wiggle(page)
                 except Exception:
-                    break
+                    if not obs:
+                        break
             dwell_done = int(time.time() - d0)
         try:
             tmp = sp + ".tmp"
@@ -325,6 +345,56 @@ def mem_mb():
     return mb
 
 
+def stop_obscura():
+    p = OBS["proc"]
+    OBS["proc"] = None
+    if p is not None and p.poll() is None:
+        try:
+            p.terminate()
+            p.wait(timeout=5)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def start_obscura():
+    """obscura serve chalao aur Playwright ko CDP se jodo. Kuch bhi fail ho to exception."""
+    import subprocess, socket
+    stop_obscura()
+    cmd = [OBSCURA_BIN, "serve", "--port", str(OBSCURA_PORT)]
+    if OBSCURA_STEALTH:
+        cmd.append("--stealth")
+    if PROXY_URL:
+        cmd += ["--proxy", PROXY_URL]
+    OBS["proc"] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.time()
+    while True:
+        if OBS["proc"].poll() is not None:
+            raise RuntimeError("obscura chalte hi band ho gaya")
+        try:
+            socket.create_connection(("127.0.0.1", OBSCURA_PORT), timeout=1).close()
+            break
+        except OSError:
+            if time.time() - t0 > 20:
+                raise RuntimeError("obscura ka port 20 sec me nahi khula")
+            time.sleep(0.5)
+    last = None
+    for ep in (f"ws://127.0.0.1:{OBSCURA_PORT}", f"http://127.0.0.1:{OBSCURA_PORT}"):   # dono tareeke try
+        try:
+            return PW.chromium.connect_over_cdp(ep, timeout=30000)
+        except Exception as e:
+            last = e
+    raise last
+
+
+def obscura_failed(why):
+    OBS["failed"] = True
+    log("OBSCURA FAIL -> Chromium par wapas:", why)
+    log_add({"event": "browser", "msg": f"Obscura fail, Chromium par wapas: {why}"[:200]})
+
+
 def launch_browser(reason):
     """Browser ek baar kholo aur chalta rakho. Sirf zaroorat par (memory, umar, crash) restart."""
     global PW, BROWSER
@@ -334,22 +404,37 @@ def launch_browser(reason):
         except Exception:
             pass
         BROWSER = None
+    stop_obscura()
     if PW is None:
         PW = sync_playwright().start()
-    pc = proxy_cfg()
-    kw = {"proxy": pc} if pc else {}
-    if pc:
-        log("proxy ON:", pc["server"])
-    BROWSER = PW.chromium.launch(executable_path=CHROME, headless=True, timeout=120000, args=[
-        "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-        "--disable-blink-features=AutomationControlled",
-        "--enable-low-end-device-mode",                 # naap me: bhaari page par peak ~20% kam
-        "--disable-extensions", "--disable-background-networking", "--mute-audio", "--no-first-run"], **kw)
+    engine = "chromium"
+    if ENGINE_WANT == "obscura" and not OBS["failed"]:
+        if not os.path.exists(OBSCURA_BIN):
+            obscura_failed(f"binary nahi mili ({OBSCURA_BIN})")
+        else:
+            try:
+                BROWSER = start_obscura()
+                engine = "obscura"
+            except Exception as e:
+                BROWSER = None
+                stop_obscura()
+                obscura_failed(f"{type(e).__name__}: {str(e)[:100]}")
+    if BROWSER is None:
+        pc = proxy_cfg()
+        kw = {"proxy": pc} if pc else {}
+        if pc:
+            log("proxy ON:", pc["server"])
+        BROWSER = PW.chromium.launch(executable_path=CHROME, headless=True, timeout=120000, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "--enable-low-end-device-mode",                 # naap me: bhaari page par peak ~20% kam
+            "--disable-extensions", "--disable-background-networking", "--mute-audio", "--no-first-run"], **kw)
+    STATUS["engine"] = engine
     STATUS["b_started"] = time.time()
     STATUS["restarts"] += 1
     STATUS["last_restart"] = f"{fmt_t(time.time())} - {reason}"
-    log("browser start:", reason)
-    log_add({"event": "browser", "msg": f"browser start: {reason}"})
+    log("browser start:", f"[{engine}]", reason)
+    log_add({"event": "browser", "msg": f"browser start [{engine}]: {reason}"})
     return BROWSER
 
 
@@ -382,6 +467,8 @@ def run_round(apps):
                 break
             except Exception as e:
                 log("visit error:", u, type(e).__name__, str(e)[:120])
+                if STATUS["engine"] == "obscura":
+                    obscura_failed(f"visit error {type(e).__name__}: {str(e)[:80]}")
                 try:
                     launch_browser(f"error: {type(e).__name__}")
                 except Exception as e2:
@@ -496,7 +583,7 @@ def dashboard():
     bs = STATUS["b_started"]
     if bs:
         ag = int(now - bs)
-        browser_line = (f"khula hai {ag//3600}h {ag%3600//60}m se &middot; memory abhi {STATUS['mem_now']:.0f} MB, "
+        browser_line = (f"engine: <b>{STATUS['engine']}</b> &middot; khula hai {ag//3600}h {ag%3600//60}m se &middot; memory abhi {STATUS['mem_now']:.0f} MB, "
                         f"peak {STATUS['mem_peak']:.0f} MB (limit {MEM_LIMIT} MB) &middot; starts: {STATUS['restarts']} "
                         f"&middot; aakhri: {esc(STATUS['last_restart'])}")
     else:
