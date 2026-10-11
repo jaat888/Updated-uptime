@@ -21,6 +21,7 @@ SEED = [u.strip() for u in os.environ.get("APP_URLS", "").replace("\n", ",").spl
 EVERY = env_int("EVERY_MIN", 3) * 60          # rounds ke beech gap
 DWELL = env_int("DWELL_SEC", 45)              # jaagne ke baad page par kitni der ruke
 WAKE_MAX = env_int("WAKE_MAX", 150)           # ek app ko jagane ka max wait
+WAKE_RELOAD = env_int("WAKE_RELOAD_SEC", 45)    # wake page khud na khule to itne sec baad hi reload (5 sec wala reload band)
 LOG_DAYS = env_int("LOG_DAYS", 3)
 COOKIE_DAYS = env_int("COOKIE_DAYS", 3)
 MEM_LIMIT = env_int("MEM_LIMIT_MB", 400)        # itni memory (MB) par browser restart hoga
@@ -205,21 +206,46 @@ def visit(browser, url):
     page = ctx.new_page()
     page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
     t0, status, gate, first = time.time(), None, None, None
-    ok, dwell_done = False, 0
+    ok, dwell_done, reloads = False, 0, 0
+    nav = {"status": None, "gate": None, "n": 0}
+
+    def on_resp(r):                           # page khud navigate kare (wake page -> app) to yahan pata chalta hai
+        try:
+            if r.request.is_navigation_request() and r.frame == page.main_frame:
+                nav["status"], nav["gate"] = r.status, r.headers.get("x-blitz-gate")
+                nav["n"] += 1
+        except Exception:
+            pass
+
+    def awake(s_, g_):
+        return bool(s_ and s_ < 400 and not g_)
+
+    def load():
+        try:
+            r = page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            return (r.status if r else None), (r.headers.get("x-blitz-gate") if r else None)
+        except Exception as e:
+            return None, f"err:{type(e).__name__}"
+
+    page.on("response", on_resp)
     try:
-        while time.time() - t0 < WAKE_MAX:
-            try:
-                r = page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                status = r.status if r else None
-                gate = r.headers.get("x-blitz-gate") if r else None
-            except Exception as e:
-                status, gate = None, f"err:{type(e).__name__}"
-            if first is None:
-                first = (status, gate)
-            if status and status < 400 and not gate:
-                ok = True
-                break
-            time.sleep(5)
+        status, gate = load()                 # sirf ek baar kholo
+        first = (status, gate)
+        ok = awake(status, gate)
+        seen, last_load = nav["n"], time.time()
+        while not ok and time.time() - t0 < WAKE_MAX:
+            page.wait_for_timeout(2000)       # wake page par tab khula rehne do, bar-bar reload nahi
+            if nav["n"] != seen:              # wake page ne khud app khola ya naya page laya
+                seen = nav["n"]
+                status, gate = nav["status"], nav["gate"]
+                ok = awake(status, gate)
+                continue
+            wait_s = 5 if str(gate).startswith("err:") else WAKE_RELOAD   # network error ho to jaldi retry, warna dheema reload
+            if time.time() - last_load >= wait_s:
+                reloads += 1
+                status, gate = load()
+                seen, last_load = nav["n"], time.time()
+                ok = awake(status, gate)
         if ok:
             d0 = time.time()
             while time.time() - d0 < DWELL:         # page par asli insaan jaisa thoda ruko
@@ -243,9 +269,9 @@ def visit(browser, url):
             pass
     was_asleep = not (first and first[0] and first[0] < 400 and not first[1])
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
-           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies}
+           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
-                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'}")
+                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads}")
     log_add(res)
     return res
 
