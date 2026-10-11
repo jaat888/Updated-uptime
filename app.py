@@ -287,13 +287,17 @@ POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 30)) * 60
 POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 150))
 POOL_KEEP = max(1, env_int("POOL_KEEP", 15))
 POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
-POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 20)))
+POOL_WORKERS = max(1, min(20, env_int("POOL_WORKERS", 15)))     # 20 se upar nahi (Render free par RAM bachane ke liye)
+POOL_BATCH = max(10, env_int("POOL_BATCH", 60))                  # itne proxy ek saath, phir RAM check
+POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 380)               # itni RAM (MB) se upar ho to test ruk jata hai
 POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
 POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 1) != 0   # pool khali ho to server ke IP se visit
 POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
 POOL_LOCK = threading.Lock()
 POOL_EVT = threading.Event()
 LAST_PX = {"hp": None}
+import ssl as _ssl
+_SSL_CTX = _ssl.create_default_context()      # sab tests isi ek context ko use karte hain (RAM bachti hai)
 _IPPORT = re.compile(r"(?:(socks5|socks4|https?)://)?(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})(?!\d)", re.I)
 
 
@@ -374,7 +378,7 @@ def _test_socks(hp):
     th = urlparse(POOL_TEST_URL)
     try:
         sk.connect((th.hostname, th.port or 443))
-        ss = ssl.create_default_context().wrap_socket(sk, server_hostname=th.hostname)   # certificate verify
+        ss = _SSL_CTX.wrap_socket(sk, server_hostname=th.hostname)   # certificate verify
         ss.sendall(f"GET {th.path or '/'} HTTP/1.1\r\nHost: {th.hostname}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode())
         head = ss.recv(256)
         ss.close()
@@ -395,7 +399,7 @@ def pool_test_one(hp):
                 return None
         else:
             ph = urllib.request.ProxyHandler({"http": hp, "https": hp})
-            op = urllib.request.build_opener(ph)
+            op = urllib.request.build_opener(ph, urllib.request.HTTPSHandler(context=_SSL_CTX))
             req = urllib.request.Request(POOL_TEST_URL, headers={"User-Agent": "Mozilla/5.0"})
             with op.open(req, timeout=POOL_MAX_MS / 1000.0) as r:
                 r.read(2048)
@@ -417,19 +421,35 @@ def pool_refresh():
         random.shuffle(allp)
         sample = allp[:POOL_TEST_N]
         good = []
-        if sample:
+        done = 0
+        stopped = False
+        for i in range(0, len(sample), POOL_BATCH):
+            waited = 0
+            while mem_mb() > POOL_MEM_PAUSE and waited < 90:      # RAM zyada hai: thoda ruko, crash se bachao
+                time.sleep(5)
+                waited += 5
+            if mem_mb() > POOL_MEM_PAUSE:
+                stopped = True
+                log(f"pool: RAM {mem_mb():.0f} MB > {POOL_MEM_PAUSE} MB, test yahin roka ({done}/{len(sample)} ho chuke)")
+                break
+            batch = sample[i:i + POOL_BATCH]
             with ThreadPoolExecutor(max_workers=POOL_WORKERS) as ex:
-                for res in ex.map(pool_test_one, sample):
+                for res in ex.map(pool_test_one, batch):
                     if res:
                         good.append(res)
+            done += len(batch)
+            import gc
+            gc.collect()
         good.sort(key=lambda g: g["ms"])
         good = good[:POOL_KEEP]
         with POOL_LOCK:
-            POOL["good"] = good
-            POOL["cc"] = {g["hp"]: ccmap.get(g["hp"]) for g in good}
+            if good or not stopped:                  # RAM ki wajah se kuch mila hi nahi to purana pool bacha ke rakho
+                POOL["good"] = good
+                POOL["cc"] = {g["hp"]: ccmap.get(g["hp"]) for g in good}
             POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > time.time()}
-            POOL["found"], POOL["tested"], POOL["updated"] = len(allp), len(sample), time.time()
-            POOL["note"] = f"{len(sample)} test, {len(good)} chal rahe" + (f", sabse tez {good[0]['ms']} ms" if good else "")
+            POOL["found"], POOL["tested"], POOL["updated"] = len(allp), done, time.time()
+            POOL["note"] = (f"{done} test, {len(good)} chal rahe" + (f", sabse tez {good[0]['ms']} ms" if good else "")
+                            + (" (RAM ki wajah se beech me roka)" if stopped else ""))
         msg = f"free proxy pool: {POOL['note']}"
         log(msg)
         log_add({"event": "proxy", "msg": msg})
