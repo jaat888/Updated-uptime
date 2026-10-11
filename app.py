@@ -410,6 +410,17 @@ def proxy_auto():
     return POOL_AUTO_ENV and not PROXY_URL
 
 
+_LAST_EV = {"m": "", "t": 0.0}
+
+
+def log_event(msg):
+    """Dashboard log me event, par wahi baat 60 sec me dobara nahi (baar-baar click par spam nahi)."""
+    if msg == _LAST_EV["m"] and time.time() - _LAST_EV["t"] < 60:
+        return
+    _LAST_EV["m"], _LAST_EV["t"] = msg, time.time()
+    log_add({"event": "proxy", "msg": msg})
+
+
 class NoProxy(RuntimeError):
     pass
 
@@ -606,6 +617,8 @@ def pool_refresh(deadline=None, limit=None):
         good = []
         done = 0
         why = ""
+        with POOL_LOCK:
+            POOL["prog"] = {"done": 0, "total": len(sample), "good": 0, "t0": t0}
         est = 25.0                                  # ek batch ka andaza (sec), pehle batch ke baad asli number
         for i in range(0, len(sample), POOL_BATCH):
             if deadline:
@@ -630,6 +643,8 @@ def pool_refresh(deadline=None, limit=None):
                         good.append(res)
             est = max(10.0, time.time() - bt)
             done += len(batch)
+            with POOL_LOCK:
+                POOL["prog"] = {"done": done, "total": len(sample), "good": len(good), "t0": t0}
             POOL_STATE["day_n"] += len(batch)
             for x in batch:
                 ta[x] = time.time()
@@ -661,6 +676,7 @@ def pool_refresh(deadline=None, limit=None):
     finally:
         with POOL_LOCK:
             POOL["busy"] = False
+            POOL["prog"] = None
 
 
 def pool_sync_scanner():
@@ -2038,16 +2054,29 @@ def self_ping():
 
 # ---------------------------------------------------------------- dashboard
 CSS = """
-body{font-family:system-ui,sans-serif;margin:0;padding:12px;background:#f5f5f7;color:#1c1c1e;font-size:15px}
-h1{font-size:20px;margin:4px 0 2px}h2{font-size:16px;margin:18px 0 6px}
-.card{background:#fff;border-radius:12px;padding:12px;margin:10px 0;box-shadow:0 1px 3px #0001;overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid #eee;white-space:nowrap}
-.ok{color:#0a7d33;font-weight:600}.bad{color:#c0262d;font-weight:600}.mut{color:#777;font-size:12px}
-input[type=text],input[type=url]{padding:9px;width:100%;box-sizing:border-box;border:1px solid #ccc;border-radius:8px;font-size:15px}
-button{padding:8px 14px;border:0;border-radius:8px;background:#1c64f2;color:#fff;font-size:14px}
-button.red{background:#c0262d}button.grey{background:#555}
-form{display:inline}
+:root{--bg:#f4f5f8;--card:#fff;--tx:#1b1d22;--mu:#6b7280;--ln:#e8eaf0;--ac:#2563eb;--ok:#0f9d58;--bad:#d93025;--warn:#d97706}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b22;--tx:#e8eaf0;--mu:#9aa3b2;--ln:#262a34;--ac:#4f8cff}}
+*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:12px;background:var(--bg);color:var(--tx);font-size:15px;max-width:760px;margin:auto}
+h1{font-size:20px;margin:6px 0}h2{font-size:15px;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card{background:var(--card);border-radius:14px;padding:14px;margin:12px 0;border:1px solid var(--ln)}
+.mu{color:var(--mu);font-size:12px;line-height:1.5}.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}.warn{color:var(--warn);font-weight:600}
+.chip{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ln);margin:2px 4px 2px 0}
+.chip.g{background:#0f9d5822;color:var(--ok)}.chip.r{background:#d9302222;color:var(--bad)}.chip.y{background:#d9770622;color:var(--warn)}
+.bar{height:9px;background:var(--ln);border-radius:9px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--ac);border-radius:9px}
+.bar.mem i{background:var(--ok)}.bar.mem.hi i{background:var(--warn)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--ln)}.row:last-child{border:0}
+.row b{word-break:break-all}
+input[type=text],input[type=password]{display:block;width:100%;padding:11px;margin:6px 0;border:1px solid var(--ln);border-radius:10px;font-size:15px;background:var(--bg);color:var(--tx)}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.btns button{flex:1 1 140px}
+button{padding:11px 14px;border:0;border-radius:10px;background:var(--ac);color:#fff;font-size:14px;font-weight:600}
+button.red{background:var(--bad)}button.grey{background:#59606e}button.sm{padding:6px 11px;flex:none}button:disabled{opacity:.5}
+form{margin:0}.lg{padding:8px 0;border-bottom:1px solid var(--ln);font-size:13px;line-height:1.45}.lg:last-child{border:0}.lg .t{color:var(--mu);font-size:11px}
+.ev{color:var(--mu);font-style:italic}a{color:var(--ac)}code{background:var(--ln);padding:1px 5px;border-radius:5px;font-size:12px;word-break:break-all}
 """
+
+
+def _chip(txt, cls=""):
+    return f'<span class="chip {cls}">{txt}</span>'
 
 
 def esc(s):
@@ -2059,123 +2088,106 @@ def dashboard():
     now = time.time()
     entries = log_read(now - LOG_DAYS * 86400)
     day = [e for e in entries if e.get("t", 0) >= now - 86400 and "url" in e]
-    rows = []
+    # ---- apps
+    app_rows = []
     for u in apps:
         mine = [e for e in entries if e.get("url") == u]
         last = mine[-1] if mine else None
         d24 = [e for e in day if e["url"] == u]
         slept = sum(1 for e in d24 if e.get("was_asleep"))
-        if last:
-            st = f'<span class="{"ok" if last.get("ok") else "bad"}">{"AWAKE" if last.get("ok") else "ASLEEP"}</span>'
-            lt = fmt_t(last["t"])
-        else:
-            st, lt = '<span class="mut">abhi tak visit nahi</span>', "-"
-        rows.append(
-            f"<tr><td>{esc(u)}</td><td>{st}</td><td>{lt}</td><td>{slept}/{len(d24)}</td>"
-            f'<td><form method="post" action="/del" onsubmit="return confirm(\'Hata dun?\')">'
-            f'<input type="hidden" name="url" value="{esc(u)}"><button class="red">Delete</button></form></td></tr>')
-    log_rows = []
-    for e in reversed(entries[-150:]):
+        st = (_chip("AWAKE", "g") if last.get("ok") else _chip("ASLEEP", "r")) if last else _chip("abhi visit nahi")
+        when = fmt_t(last["t"]) if last else "-"
+        app_rows.append(
+            f'<div class="row"><div><b>{esc(u.replace("https://", "").replace("http://", ""))}</b><br>{st}'
+            f'<span class="mu">aakhri: {when} &middot; 24h me so raha tha {slept}/{len(d24)}</span></div>'
+            f'<form method="post" action="/del" onsubmit="return confirm(\'Hata dun?\')">'
+            f'<input type="hidden" name="url" value="{esc(u)}"><button class="red sm">Delete</button></form></div>')
+    # ---- log (cards, no wide table)
+    logs = []
+    for e in reversed(entries[-60:]):
         if "event" in e:
             if e["event"] == "round":
-                g = e.get("gap")
-                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="7" class="mut">--- round, {e.get("apps")} apps'
-                                + (f", pichhle se {g//60}m{g%60}s" if g else "") + "</td></tr>")
-            else:
-                log_rows.append(f'<tr><td>{fmt_t(e["t"])}</td><td colspan="7" class="bad">{esc(e.get("msg", e["event"]))}</td></tr>')
+                continue
+            logs.append(f'<div class="lg ev"><span class="t">{fmt_t(e["t"])}</span> &middot; {esc(e.get("msg", e["event"]))}</div>')
             continue
-        log_rows.append(
-            f'<tr><td>{fmt_t(e["t"])}</td><td>{esc(e["url"].replace("https://", "").replace("http://", ""))}</td>'
-            f'<td class="{"ok" if e.get("ok") else "bad"}">{esc(e.get("status"))}{" " + esc(e["gate"]) if e.get("gate") else ""}</td>'
-            f'<td>{"SO RAHA THA" if e.get("was_asleep") else "jaaga tha"}</td><td>{e.get("took")}s</td>'
-            f'<td>{"cookies" if e.get("cookies") else "nayi"}</td>'
-            f'<td>{esc(mask_proxy(e.get("via")).replace("http://", "").replace("https://", "") if e.get("via") not in (None, "seedha") else "seedha (server IP)")}'
-            f'{" [" + esc(e["cc"]) + "]" if e.get("cc") else ""}</td>'
-            f'<td>{esc(e.get("phone") or "-")}{" / A" + esc(e["android"]) if e.get("android") else ""}</td></tr>')
+        okc = "ok" if e.get("ok") else "bad"
+        via = e.get("via")
+        via_s = "server IP" if via in (None, "seedha") else esc(mask_proxy(via).replace("http://", "").replace("https://", ""))
+        logs.append(
+            f'<div class="lg"><span class="t">{fmt_t(e["t"])}</span><br>'
+            f'<b>{esc(e["url"].replace("https://", "").replace("http://", "").strip("/"))}</b> '
+            f'<span class="{okc}">{esc(e.get("status"))}{" " + esc(e["gate"]) if e.get("gate") else ""}</span> &middot; '
+            f'{"so raha tha" if e.get("was_asleep") else "jaaga tha"} &middot; {e.get("took")}s<br>'
+            f'<span class="mu">{via_s}{" [" + esc(e["cc"]) + "]" if e.get("cc") else ""} &middot; '
+            f'{esc(e.get("phone") or "-")}{" A" + esc(e["android"]) if e.get("android") else ""} &middot; '
+            f'{"cookies" if e.get("cookies") else "nayi"}</span></div>')
+    # ---- status header
     nxt = STATUS.get("next")
     nxt_s = "abhi chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec me" if nxt else "-")
     up = int(now - STATUS["started"])
-    try:
-        files = os.listdir(STATE_DIR)
-        cb = sum(os.path.getsize(os.path.join(STATE_DIR, f)) for f in files)
-    except OSError:
-        files, cb = [], 0
-    if HUMAN:
-        mode_line = f"insaan mode: ~{VISITS_30} visit/30 min (random), page par {DWELL_MIN}-{DWELL_MAX}s, andar se request {'ON' if INPAGE else 'OFF'}"
-    else:
-        mode_line = f"gap {EVERY//60} min, page par ruko {DWELL}s"
-    bs = STATUS["b_started"]
-    if bs:
-        ag = int(now - bs)
-        browser_line = (f"engine: <b>{STATUS['engine']}</b> &middot; khula hai {ag//3600}h {ag%3600//60}m se &middot; memory abhi {STATUS['mem_now']:.0f} MB, "
-                        f"peak {STATUS['mem_peak']:.0f} MB (limit {MEM_LIMIT} MB) &middot; starts: {STATUS['restarts']} "
-                        f"&middot; aakhri: {esc(STATUS['last_restart'])}")
-    else:
-        browser_line = "abhi shuru nahi hua"
-    cur_proxy = get_proxy_url()
-    if proxy_auto():
-        with POOL_LOCK:
-            pg, pn = len(POOL["good"]), POOL["note"]
-            pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
-            pb = " (test chal raha hai)" if POOL["busy"] else ""
-        proxy_status = (f'<span class="ok">AUTO (free GitHub pool)</span> &mdash; {pg} proxy ready &middot; {esc(pn)} '
-                        f'&middot; aakhri update {pu}{pb}'
-                        + ('' if pool_ready() else ' &middot; <span class="bad">visit ruki hain (pehle scan poora hoga)</span>'))
-    else:
-        proxy_status = (f'<span class="ok">ON</span> &mdash; <code>{esc(mask_proxy(cur_proxy))}</code>'
-                        if cur_proxy else '<span class="mut">Band hai (server ka apna IP use ho raha hai)</span>')
-    proxy_card = f"""
-<div class="card"><h2 style="margin-top:0">Proxy</h2>
-<div style="margin-bottom:8px">Abhi: {proxy_status}</div>
-<form method="post" action="/proxy" style="display:block" autocomplete="off">
-  <input type="text" name="proxy_url" placeholder="naya proxy: http://user:pass@host:port" autocomplete="off">
-  <div style="margin-top:8px;display:flex;gap:8px">
-    <button type="submit" name="act" value="save">Save karo</button>
-    <button type="submit" name="act" value="off" class="red">Band karo</button>
-    <button type="submit" name="act" value="auto" class="grey">Free auto</button>
-  </div>
-</form>
-<div class="mut" style="margin-top:8px">Format: <code>http://user:pass@host:port</code> &nbsp;|&nbsp; <code>socks5://host:port</code> (socks5 par login nahi chalta)<br>
-Password yahan kabhi nahi dikhta. Box khali chhod ke Save karoge to kuch nahi badlega.
-Naya proxy agli visit se pehle browser restart karke lagega.</div>
-</div>"""
+    mem, lim = STATUS.get("mem_now", 0) or 0, MEM_LIMIT
+    pct = max(0, min(100, int(mem * 100 / lim))) if lim else 0
+    # ---- proxy / pool
+    cur = get_proxy_url()
+    auto = proxy_auto()
     s_url, _k = scanner_cfg()
-    if s_url:
-        scan_status = f'<span class="ok">CLOUDFLARE / alag scanner</span> &mdash; <code>{esc(s_url)}</code>'
+    with POOL_LOCK:
+        pnote, busy, prog = POOL["note"], POOL["busy"], POOL.get("prog")
+        pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
+    pg = pool_good_n()
+    ready = pool_ready()
+    if auto:
+        mode_chip = _chip("FREE AUTO", "g")
+        src = _chip("scanner: Cloudflare", "y") if s_url else _chip("scanner: Render khud", "g")
+        state = _chip(f"{pg} proxy ready", "g" if pg else "r") + (_chip("visit chalu", "g") if ready else _chip("visit ruki hain (scan poora hoga)", "y"))
+    elif cur:
+        mode_chip, src = _chip("MANUAL PROXY", "g"), f'<code>{esc(mask_proxy(cur))}</code>'
+        state = ""
     else:
-        scan_status = '<span class="ok">RENDER KHUD</span> &mdash; proxy test isi server par hota hai (RAM lagti hai)'
-    scanner_card = f"""
-<div class="card"><h2 style="margin-top:0">Proxy scanner (kaun test kare)</h2>
-<div style="margin-bottom:8px">Abhi: {scan_status}</div>
-<form method="post" action="/scanner" style="display:block" autocomplete="off">
-  <input type="text" name="scanner_url" placeholder="https://naam.akaunt.workers.dev" autocomplete="off">
-  <input type="password" name="scanner_key" placeholder="scanner password (SCAN_KEY)" autocomplete="off" style="margin-top:8px">
-  <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-    <button type="submit" name="act" value="remote">Cloudflare use karo</button>
-    <button type="submit" name="act" value="local" class="grey">Render khud test kare</button>
-  </div>
-</form>
-<div class="mut" style="margin-top:8px">Ye tabhi kaam karta hai jab upar Proxy me <b>Free auto</b> chuna ho. Cloudflare chunne se pehle URL/password check hota hai,
-galat ho to save nahi hota. Password yahan kabhi nahi dikhta (box khali chhodoge to purana wahi rahega). Badalte hi list turant dobara li jati hai.</div>
-</div>"""
+        mode_chip, src, state = _chip("PROXY BAND", "r"), "", _chip("server IP se visit ho rahi hai", "r")
+    prog_html = ""
+    if prog and prog.get("total"):
+        p = int(prog["done"] * 100 / prog["total"])
+        el = int(now - prog["t0"])
+        prog_html = (f'<div class="mu" style="margin-top:8px">Scan chal raha hai: <b>{prog["done"]}/{prog["total"]}</b> test, '
+                     f'{prog["good"]} chale &middot; {el//60}m{el%60}s</div><div class="bar"><i style="width:{p}%"></i></div>')
+    elif busy:
+        prog_html = '<div class="mu" style="margin-top:8px">Scan shuru ho raha hai (list download)...</div>'
+    mode_line = (f"insaan mode &middot; 30 min me {VISITS_MIN}-{VISITS_MAX} visit &middot; page par {DWELL_MIN}-{DWELL_MAX}s"
+                 if HUMAN else f"har {EVERY//60} min &middot; page par {DWELL}s")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Keepalive</title><style>{CSS}</style></head><body>
-<h1>Keepalive dashboard</h1>
-<div class="mut">Server chalu hua: {fmt_t(STATUS["started"])} ({up//3600}h {up%3600//60}m pehle) &middot; agla round: {nxt_s}
-&middot; {mode_line} &middot; cookies: {len(files)} files, {cb//1024} KB</div>
-<div class="mut">Browser: {browser_line}</div>
-<div class="card"><h2 style="margin-top:0">Apps ({len(apps)})</h2>
-<table><tr><th>App</th><th>Abhi</th><th>Aakhri visit</th><th>24h me so raha tha</th><th></th></tr>{''.join(rows) or '<tr><td colspan=5 class="mut">Koi app nahi. Neeche se jodo.</td></tr>'}</table>
-<form method="post" action="/add" style="display:block;margin-top:10px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
-<div style="margin-top:8px"><button>Add karo</button></div></form>
-<form method="post" action="/run" style="margin-top:8px"><button class="grey">Abhi visit karo</button></form></div>
-{proxy_card}
-{scanner_card}
-<div class="card"><h2 style="margin-top:0">Log (pichhle {LOG_DAYS} din, naya upar)</h2>
-<table><tr><th>Time</th><th>App</th><th>Status</th><th>Visit se pehle</th><th>Laga</th><th>Browser</th><th>Proxy</th><th>Phone</th></tr>{''.join(log_rows) or '<tr><td colspan=8 class="mut">Abhi log khali hai.</td></tr>'}</table>
-<div class="mut" style="margin-top:8px"><a href="/log.txt">log download</a></div></div>
-<div class="mut">Dhyan: Render free ka disk restart/redeploy par saaf ho jata hai. Tab apps list <code>APP_URLS</code> se wapas banegi aur log khali hoga.</div>
-</body></html>"""
+<h1>Keepalive</h1>
+<div class="card">
+  <div>{mode_chip}{src}{state}</div>
+  {prog_html}
+  <div class="mu" style="margin-top:10px">RAM {mem:.0f} / {lim} MB &middot; peak {STATUS['mem_peak']:.0f} MB &middot; browser: {esc(STATUS['engine'])}, restarts {STATUS['restarts']}</div>
+  <div class="bar mem{' hi' if pct > 85 else ''}"><i style="width:{pct}%"></i></div>
+  <div class="mu">Server {up//3600}h {up%3600//60}m se chalu &middot; agla round: {nxt_s} &middot; {mode_line}<br>Pool: {esc(pnote)} &middot; update {pu}</div>
+</div>
+<div class="card"><h2>Apps ({len(apps)})</h2>{''.join(app_rows) or '<div class="mu">Koi app nahi. Neeche se jodo.</div>'}
+<form method="post" action="/add" style="margin-top:10px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
+<div class="btns"><button>Add karo</button></div></form>
+<form method="post" action="/run"><div class="btns"><button class="grey">Abhi visit karo</button></div></form></div>
+<div class="card"><h2>Proxy</h2>
+<form method="post" action="/proxy" autocomplete="off">
+  <input type="text" name="proxy_url" placeholder="manual proxy: http://user:pass@host:port" autocomplete="off">
+  <div class="btns"><button name="act" value="save">Manual save</button><button name="act" value="auto" class="grey">Free auto</button><button name="act" value="off" class="red">Band</button></div>
+</form>
+<div class="mu" style="margin-top:8px">Band = server ka apna IP. Free auto me pehle {POOL_START_TEST} proxy ka scan hota hai, tab tak visit ruki rehti hain.</div>
+<h2 style="margin-top:16px">Free auto: scanner kaun?</h2>
+<form method="post" action="/scanner" autocomplete="off">
+  <input type="text" name="scanner_url" placeholder="https://naam.akaunt.workers.dev" autocomplete="off">
+  <input type="password" name="scanner_key" placeholder="scanner password (SCAN_KEY)" autocomplete="off">
+  <div class="btns"><button name="act" value="remote">Cloudflare use karo</button><button name="act" value="local" class="grey">Render khud test kare</button></div>
+</form>
+<div class="mu" style="margin-top:8px">Dono button Free auto bhi on kar dete hain. Cloudflare ka URL/password pehle check hota hai. Password dikhta nahi; box khali = purana.</div></div>
+<div class="card"><h2>Log <a class="mu" href="/log.txt">download</a></h2>{''.join(logs) or '<div class="mu">Abhi log khali hai.</div>'}</div>
+<div class="mu">Render free ka disk restart par saaf hota hai; apps list <code>APP_URLS</code> se wapas banegi.</div>
+<script>
+document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',()=>{{setTimeout(()=>f.querySelectorAll('button').forEach(b=>b.disabled=true),0)}}));
+setInterval(()=>{{const a=document.activeElement;if(!a||a.tagName!=='INPUT')location.reload()}},12000);
+</script></body></html>"""
 
 
 class H(BaseHTTPRequestHandler):
@@ -2248,7 +2260,13 @@ class H(BaseHTTPRequestHandler):
                     save_scanner("local")
                 except Exception as e:
                     return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
-                log_add({"event": "proxy", "msg": "scanner: Render khud test karega"})
+                if not proxy_auto():
+                    try:
+                        save_proxy_url(PROXY_AUTO)
+                        RESTART["why"] = "free auto mode on"
+                    except Exception:
+                        pass
+                log_event("scanner: Render khud test karega")
                 POOL_EVT.set()
                 return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
             if act == "remote":
@@ -2274,7 +2292,13 @@ class H(BaseHTTPRequestHandler):
                     save_scanner("remote", url, key)
                 except Exception as e:
                     return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
-                log_add({"event": "proxy", "msg": f"scanner: Cloudflare ({url}), abhi list me {len(d.get('good') or [])}"})
+                if not proxy_auto():
+                    try:
+                        save_proxy_url(PROXY_AUTO)
+                        RESTART["why"] = "free auto mode on"
+                    except Exception:
+                        pass
+                log_event(f"scanner: Cloudflare ({url}), abhi list me {len(d.get('good') or [])}")
                 POOL_EVT.set()
                 return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
             return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
@@ -2323,7 +2347,7 @@ class H(BaseHTTPRequestHandler):
                 if new_proxy == PROXY_AUTO:
                     POOL_EVT.set()
                 log("proxy update:", shown)
-                log_add({"event": "proxy", "msg": f"proxy: {shown}"})
+                log_event(f"proxy: {shown}")
                 # Playwright dusre thread se nahi chalta: yahan sirf flag, restart main loop karega
                 RESTART["why"] = f"proxy badla ({shown})"
             else:
