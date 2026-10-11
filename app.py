@@ -188,6 +188,7 @@ def prune_state(apps):
 
 
 # ---------------------------------------------------------------- proxy (optional)
+PROXY_AUTO = "auto"   # proxy.txt me ye ho to GitHub ki free list wala pool chalega
 PROXY_OFF = "off"   # proxy.txt me ye likha ho to env wala PROXY_URL bhi ignore (dashboard se "Band karo")
 
 
@@ -196,7 +197,7 @@ def get_proxy_url():
     try:
         with open(PROXY_FILE) as f:
             v = f.read().strip()
-            if v == PROXY_OFF:
+            if v == PROXY_OFF or v == PROXY_AUTO:
                 return ""
             if v:
                 return v
@@ -265,6 +266,212 @@ def proxy_cfg():
     return cfg
 
 
+# ---------------------------------------------------------------- free proxy pool (GitHub lists)
+# Har POOL_REFRESH_MIN (default 30) min me list laao, POOL_TEST_COUNT (default 150) random proxy test karo,
+# sabse tez POOL_KEEP bachao. Har visit inme se random (tez wale zyada) chunta hai.
+# Sirf Chromium engine me chalta hai (Obscura me proxy launch par fix hoti hai).
+POOL_AUTO_ENV = env_int("FREE_PROXY_AUTO", 0) != 0
+POOL_SOURCES = [x.strip() for x in os.environ.get("POOL_SOURCES", ",".join([
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
+])).split(",") if x.strip()]
+# iplocate/free-proxy-list: countries/<CC>/proxies.txt (GitHub par dekh kar confirm kiya)
+POOL_COUNTRIES = [c.strip().upper() for c in os.environ.get("POOL_COUNTRIES", "IN,US,DE,GB,SG,NL,FR,BR,ID").split(",") if c.strip()]
+IPLOC = "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/countries/"
+POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 30)) * 60
+POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 150))
+POOL_KEEP = max(1, env_int("POOL_KEEP", 15))
+POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
+POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 20)))
+POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
+POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 1) != 0   # pool khali ho to server ke IP se visit
+POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
+POOL_LOCK = threading.Lock()
+POOL_EVT = threading.Event()
+LAST_PX = {"hp": None}
+_IPPORT = re.compile(r"(?:(socks5|socks4|https?)://)?(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})(?!\d)", re.I)
+
+
+def proxy_auto():
+    try:
+        with open(PROXY_FILE) as f:
+            v = f.read().strip()
+        if v == PROXY_AUTO:
+            return True
+        if v:
+            return False
+    except OSError:
+        pass
+    return POOL_AUTO_ENV and not PROXY_URL
+
+
+def _scheme_for(src):
+    """List ke naam se default scheme: socks5.txt -> socks5, socks4.txt -> socks4, baaki http."""
+    l = src.lower()
+    return "socks5" if "socks5" in l else ("socks4" if "socks4" in l else "http")
+
+
+def _get_list(src):
+    """-> ['http://ip:port', 'socks5://ip:port', ...]. Line par scheme likha ho to wahi, warna list ke naam wala."""
+    default = _scheme_for(src)
+    req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        txt = r.read(3 * 1024 * 1024).decode("utf-8", "replace")
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.lower().startswith("https://"):
+            continue                      # TLS wali proxy (Chromium certificate reject karta hai)
+        m = _IPPORT.search(line)
+        if m and 0 < int(m.group(3)) < 65536:
+            out.append(f"{(m.group(1) or default).lower()}://{m.group(2)}:{m.group(3)}")
+    return out
+
+
+def _fetch_job(job):
+    cc, srcs = job
+    for src in srcs:
+        try:
+            out = _get_list(src)
+            if out:
+                return cc, src, out
+        except Exception:
+            continue
+    return cc, srcs[0], []
+
+
+def pool_fetch():
+    """-> {ip:port: country ya None}"""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = [(None, [s]) for s in POOL_SOURCES]
+    jobs += [(c, [f"{IPLOC}{c}/proxies.txt"]) for c in POOL_COUNTRIES]
+    found = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for cc, src, out in ex.map(_fetch_job, jobs):
+            log(f"pool: {cc or 'list'} {src.split('/')[4:6]} -> {len(out)} proxy")
+            for hp in out:
+                if cc or hp not in found:
+                    found[hp] = cc
+    return found
+
+
+def pool_country(hp):
+    return POOL["cc"].get(hp)
+
+
+def _test_socks(hp):
+    import socks, ssl
+    sch, _, hostport = hp.partition("://")
+    host, _, port = hostport.rpartition(":")
+    sk = socks.socksocket()
+    sk.set_proxy(socks.SOCKS5 if sch == "socks5" else socks.SOCKS4, host, int(port), rdns=(sch == "socks5"))
+    sk.settimeout(POOL_MAX_MS / 1000.0)
+    th = urlparse(POOL_TEST_URL)
+    try:
+        sk.connect((th.hostname, th.port or 443))
+        ss = ssl.create_default_context().wrap_socket(sk, server_hostname=th.hostname)   # certificate verify
+        ss.sendall(f"GET {th.path or '/'} HTTP/1.1\r\nHost: {th.hostname}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode())
+        head = ss.recv(256)
+        ss.close()
+    finally:
+        try:
+            sk.close()
+        except Exception:
+            pass
+    return head.startswith(b"HTTP/1.") and b" 200" in head[:16]
+
+
+def pool_test_one(hp):
+    """HTTPS test. http proxy: CONNECT, socks4/socks5: PySocks. Certificate verify hota hai, to beech me padhne wali proxy khud hat jati hai."""
+    t0 = time.time()
+    try:
+        if hp.startswith("socks"):
+            if not _test_socks(hp):
+                return None
+        else:
+            ph = urllib.request.ProxyHandler({"http": hp, "https": hp})
+            op = urllib.request.build_opener(ph)
+            req = urllib.request.Request(POOL_TEST_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with op.open(req, timeout=POOL_MAX_MS / 1000.0) as r:
+                r.read(2048)
+                if r.status != 200:
+                    return None
+    except Exception:
+        return None
+    ms = int((time.time() - t0) * 1000)
+    return {"hp": hp, "ms": ms} if ms <= POOL_MAX_MS else None
+
+
+def pool_refresh():
+    from concurrent.futures import ThreadPoolExecutor
+    with POOL_LOCK:
+        POOL["busy"] = True
+    try:
+        ccmap = pool_fetch()
+        allp = list(ccmap)
+        random.shuffle(allp)
+        sample = allp[:POOL_TEST_N]
+        good = []
+        if sample:
+            with ThreadPoolExecutor(max_workers=POOL_WORKERS) as ex:
+                for res in ex.map(pool_test_one, sample):
+                    if res:
+                        good.append(res)
+        good.sort(key=lambda g: g["ms"])
+        good = good[:POOL_KEEP]
+        with POOL_LOCK:
+            POOL["good"] = good
+            POOL["cc"] = {g["hp"]: ccmap.get(g["hp"]) for g in good}
+            POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > time.time()}
+            POOL["found"], POOL["tested"], POOL["updated"] = len(allp), len(sample), time.time()
+            POOL["note"] = f"{len(sample)} test, {len(good)} chal rahe" + (f", sabse tez {good[0]['ms']} ms" if good else "")
+        msg = f"free proxy pool: {POOL['note']}"
+        log(msg)
+        log_add({"event": "proxy", "msg": msg})
+    except Exception as e:
+        with POOL_LOCK:
+            POOL["note"] = f"refresh fail: {type(e).__name__}"
+        log("pool refresh failed:", type(e).__name__, str(e)[:100])
+    finally:
+        with POOL_LOCK:
+            POOL["busy"] = False
+
+
+def pool_loop():
+    last = 0.0
+    while True:
+        try:
+            if proxy_auto() and STATUS["engine"] != "obscura" and (POOL_EVT.is_set() or time.time() - last > POOL_REFRESH):
+                POOL_EVT.clear()
+                pool_refresh()
+                last = time.time()
+        except Exception as e:
+            log("pool loop error:", type(e).__name__)
+        POOL_EVT.wait(timeout=30)
+
+
+def pool_pick():
+    now = time.time()
+    with POOL_LOCK:
+        good = [g for g in POOL["good"] if POOL["bad"].get(g["hp"], 0) < now]
+    if not good:
+        return None
+    return random.choices(good, weights=[1.0 / max(g["ms"], 300) for g in good])[0]["hp"]   # tez wale zyada chunenge
+
+
+def pool_mark_bad(hp, why=""):
+    if not hp:
+        return
+    with POOL_LOCK:
+        POOL["bad"][hp] = time.time() + 3600      # 1 ghanta ke liye hata do
+    log("pool: proxy bad mark", hp, why)
+
+
 def scrub_proxy_log():
     """Purani log entries me agar proxy ka password likha ho to hata do (ek baar, start par)."""
     with LOCK:
@@ -298,32 +505,65 @@ def chrome_major():
     return int(STATUS["chrome_full"].split(".")[0])
 
 
-def android_ua():
+def android_ua(model=None, ver=None):
     """UA asli Chromium ke major version se banti hai (Android Chrome 'major.0.0.0' likhta hai)."""
-    return (f"Mozilla/5.0 (Linux; Android {ANDROID_VERSION}; {ANDROID_MODEL}) AppleWebKit/537.36 (KHTML, like Gecko) "
+    return (f"Mozilla/5.0 (Linux; Android {ver or ANDROID_VERSION}; {model or ANDROID_MODEL}) AppleWebKit/537.36 (KHTML, like Gecko) "
             f"Chrome/{chrome_major()}.0.0.0 Mobile Safari/537.36")
 
 
-def get_fingerprint(url):
-    """Sab apps k liye same Android phone fingerprint."""
-    return {
-        "ua": android_ua(),
-        "platform": "Linux armv8l",
-        "vendor": "Google Inc.",
-        "viewport": ANDROID_VIEWPORT,
-        "screen": ANDROID_SCREEN,
-        "color_depth": 24,
-        "dpr": 3.0,
-        "hardware_concurrency": 8,
-        "device_memory": 8,
-        "language": "en-IN",
-        "timezone_id": "Asia/Kolkata",
-        "timezone_offset": 330,
-        "battery_level": 0.82,
-        "battery_charging": False,
-        "touch": True,
-        "seed": FP_SEED,
+# Alag-alag asli Android phones. Har proxy ko hash se ek fixed phone milta hai (wahi proxy = wahi phone).
+PHONES = [
+    # model, android, (w, h), dpr, cores, ram_gb, gpu_vendor, gpu_renderer
+    ("SM-S918B", "14", (412, 915), 3.0, 8, 8, "Qualcomm", "Adreno (TM) 740"),
+    ("SM-A546E", "14", (412, 915), 2.625, 8, 4, "ARM", "Mali-G68"),
+    ("Pixel 7", "14", (412, 915), 2.625, 8, 8, "ARM", "Mali-G710"),
+    ("Pixel 6a", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G78"),
+    ("CPH2449", "13", (412, 919), 3.5, 8, 8, "Qualcomm", "Adreno (TM) 740"),
+    ("23021RAA2Y", "13", (393, 873), 2.75, 8, 4, "Qualcomm", "Adreno (TM) 619"),
+    ("SM-M346B", "13", (412, 915), 2.625, 8, 4, "ARM", "Mali-G68"),
+    ("RMX3771", "13", (412, 915), 2.625, 8, 8, "Qualcomm", "Adreno (TM) 642L"),
+]
+# country -> (language, timezone). Proxy ka desh pata ho to timezone/language usi se milte hain.
+COUNTRY_LOC = {
+    "IN": ("en-IN", "Asia/Kolkata"), "US": ("en-US", "America/New_York"), "GB": ("en-GB", "Europe/London"),
+    "DE": ("de-DE", "Europe/Berlin"), "FR": ("fr-FR", "Europe/Paris"), "NL": ("nl-NL", "Europe/Amsterdam"),
+    "SG": ("en-SG", "Asia/Singapore"), "BR": ("pt-BR", "America/Sao_Paulo"), "ID": ("id-ID", "Asia/Jakarta"),
+}
+_TZ_STD = {"Asia/Kolkata": 330, "America/New_York": -300, "Europe/London": 0, "Europe/Berlin": 60, "Europe/Paris": 60,
+           "Europe/Amsterdam": 60, "Asia/Singapore": 480, "America/Sao_Paulo": -180, "Asia/Jakarta": 420}
+
+
+def tz_offset_min(tz):
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime
+        return int(datetime.datetime.now(ZoneInfo(tz)).utcoffset().total_seconds() // 60)   # DST ke saath
+    except Exception:
+        return _TZ_STD.get(tz, 330)
+
+
+def get_fingerprint(url, px=None):
+    """px (proxy) ho to us proxy ka apna phone + desh ke hisaab se timezone. px None ho to purana Galaxy S23 Ultra."""
+    fp = {
+        "ua": android_ua(), "platform": "Linux armv8l", "vendor": "Google Inc.",
+        "viewport": ANDROID_VIEWPORT, "screen": ANDROID_SCREEN, "color_depth": 24, "dpr": 3.0,
+        "hardware_concurrency": 8, "device_memory": 8, "language": "en-IN", "timezone_id": "Asia/Kolkata",
+        "timezone_offset": 330, "battery_level": 0.82, "battery_charging": False, "touch": True, "seed": FP_SEED,
+        "model": ANDROID_MODEL, "android": ANDROID_VERSION, "gpu_vendor": "Qualcomm", "gpu_renderer": "Adreno (TM) 740",
     }
+    if not px:
+        return fp
+    h = int(hashlib.sha1(("fp|" + px).encode()).hexdigest(), 16)
+    model, ver, (w, hh), dpr, cores, ram, gv, gr = PHONES[h % len(PHONES)]
+    lang, tz = COUNTRY_LOC.get(pool_country(px) or "IN", COUNTRY_LOC["IN"])
+    fp.update({
+        "ua": android_ua(model, ver), "viewport": {"width": w, "height": hh}, "screen": {"width": w, "height": hh},
+        "dpr": dpr, "hardware_concurrency": cores, "device_memory": ram, "language": lang, "timezone_id": tz,
+        "timezone_offset": tz_offset_min(tz), "battery_level": round(0.35 + ((h >> 8) % 60) / 100.0, 2),
+        "battery_charging": bool((h >> 16) % 4 == 0), "seed": (h >> 20) & 0x7FFFFFFF,
+        "model": model, "android": ver, "gpu_vendor": gv, "gpu_renderer": gr,
+    })
+    return fp
 
 
 def ua_override(fp, native_brands):
@@ -351,8 +591,8 @@ def ua_override(fp, native_brands):
         "platform": fp["platform"],
         "userAgentMetadata": {
             "brands": brands, "fullVersionList": fulls, "fullVersion": full,
-            "platform": "Android", "platformVersion": f"{ANDROID_VERSION}.0.0",
-            "architecture": "", "bitness": "", "model": ANDROID_MODEL,   # Android Chrome in dono ko khali rakhta hai
+            "platform": "Android", "platformVersion": f"{fp.get('android', ANDROID_VERSION)}.0.0",
+            "architecture": "", "bitness": "", "model": fp.get("model", ANDROID_MODEL),   # Android Chrome in dono ko khali rakhta hai
             "mobile": True, "wow64": False,
         },
     }
@@ -413,7 +653,7 @@ _FP_INIT_SCRIPT = """
   } catch(e){}
 
   // ── 5. Timezone ─────────────────────────────────────────────────────────
-  try { Date.prototype.getTimezoneOffset = function() { return -330; }; } catch(e){}
+  try { Date.prototype.getTimezoneOffset = function() { return -fp.timezone_offset; }; } catch(e){}
 
   // ── 6. WebGL — Adreno 740 (Galaxy S23 Ultra) spoof ─────────────────────
   const _getCtx = HTMLCanvasElement.prototype.getContext;
@@ -425,9 +665,9 @@ _FP_INIT_SCRIPT = """
         const _getPar = ctx.getParameter.bind(ctx);
         ctx.getParameter = function(p) {
           // UNMASKED_VENDOR_WEBGL
-          if (p === 37445) return 'Qualcomm';
+          if (p === 37445) return fp.gpu_vendor || 'Qualcomm';
           // UNMASKED_RENDERER_WEBGL
-          if (p === 37446) return 'Adreno (TM) 740';
+          if (p === 37446) return fp.gpu_renderer || 'Adreno (TM) 740';
           // MAX_TEXTURE_SIZE
           if (p === 3379)  return 16384;
           // MAX_RENDERBUFFER_SIZE
@@ -824,7 +1064,8 @@ def human_dwell(page, url, obs, touch):
 
 def visit(browser, url):
     sp = state_path(url)
-    fp = get_fingerprint(url)                           # per-app stable fingerprint
+    px = pool_pick() if (proxy_auto() and STATUS["engine"] != "obscura") else None
+    fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
     vp = fp["viewport"]                                 # hamesha phone ka size (is_mobile ke saath desktop size mismatch hota)
     kw = dict(user_agent=fp["ua"], viewport=vp,
               locale=fp["language"], timezone_id=fp["timezone_id"],
@@ -844,6 +1085,14 @@ def visit(browser, url):
             except OSError:
                 pass
     obs = STATUS["engine"] == "obscura"
+    LAST_PX["hp"] = None
+    if proxy_auto() and not obs:
+        if px:
+            kw["proxy"] = {"server": px}
+            LAST_PX["hp"] = px
+            log(f"pool proxy: {px} [{pool_country(px) or '?'}] phone={fp['model']} Android {fp['android']} tz={fp['timezone_id']}")
+        elif not POOL_FALLBACK_DIRECT:
+            raise RuntimeError("pool me koi chalta proxy nahi")
     if obs and had_cookies:
         try:
             ctx = browser.new_context(storage_state=sp, **kw)
@@ -866,6 +1115,7 @@ def visit(browser, url):
             "battery_charging": fp["battery_charging"],
             "timezone_offset": fp["timezone_offset"],
             "seed": fp["seed"],
+            "gpu_vendor": fp.get("gpu_vendor", "Qualcomm"), "gpu_renderer": fp.get("gpu_renderer", "Adreno (TM) 740"),
         })
         ctx.add_init_script(_FP_INIT_SCRIPT.replace("__FP__", fp_json))
     except Exception:
@@ -1158,9 +1408,13 @@ def run_one(u):
     for attempt in (1, 2):
         try:
             check_health()
-            return visit(get_browser(), u)
+            res = visit(get_browser(), u)
+            if LAST_PX["hp"] and not (res and res.get("ok")):
+                pool_mark_bad(LAST_PX["hp"], "visit ok nahi")
+            return res
         except Exception as e:
             log("visit error:", u, type(e).__name__, str(e)[:120])
+            pool_mark_bad(LAST_PX["hp"], type(e).__name__)
             if STATUS["engine"] == "obscura":
                 obscura_failed(f"visit error {type(e).__name__}: {str(e)[:80]}")
             try:
@@ -1354,8 +1608,16 @@ def dashboard():
     else:
         browser_line = "abhi shuru nahi hua"
     cur_proxy = get_proxy_url()
-    proxy_status = (f'<span class="ok">ON</span> &mdash; <code>{esc(mask_proxy(cur_proxy))}</code>'
-                    if cur_proxy else '<span class="mut">Band hai (server ka apna IP use ho raha hai)</span>')
+    if proxy_auto():
+        with POOL_LOCK:
+            pg, pn = len(POOL["good"]), POOL["note"]
+            pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
+            pb = " (test chal raha hai)" if POOL["busy"] else ""
+        proxy_status = (f'<span class="ok">AUTO (free GitHub pool)</span> &mdash; {pg} proxy ready &middot; {esc(pn)} '
+                        f'&middot; aakhri update {pu}{pb}')
+    else:
+        proxy_status = (f'<span class="ok">ON</span> &mdash; <code>{esc(mask_proxy(cur_proxy))}</code>'
+                        if cur_proxy else '<span class="mut">Band hai (server ka apna IP use ho raha hai)</span>')
     proxy_card = f"""
 <div class="card"><h2 style="margin-top:0">Proxy</h2>
 <div style="margin-bottom:8px">Abhi: {proxy_status}</div>
@@ -1364,6 +1626,7 @@ def dashboard():
   <div style="margin-top:8px;display:flex;gap:8px">
     <button type="submit" name="act" value="save">Save karo</button>
     <button type="submit" name="act" value="off" class="red">Band karo</button>
+    <button type="submit" name="act" value="auto" class="grey">Free auto</button>
   </div>
 </form>
 <div class="mut" style="margin-top:8px">Format: <code>http://user:pass@host:port</code> &nbsp;|&nbsp; <code>socks5://host:port</code> (socks5 par login nahi chalta)<br>
@@ -1477,6 +1740,8 @@ class H(BaseHTTPRequestHandler):
                 raw = (form.get("proxy_url") or [""])[0].strip()
                 if act == "off":
                     new_proxy = ""
+                elif act == "auto":
+                    new_proxy = PROXY_AUTO
                 elif raw:
                     new_proxy = check_proxy(raw)
                     if not new_proxy:
@@ -1488,7 +1753,9 @@ class H(BaseHTTPRequestHandler):
                     save_proxy_url(new_proxy)
                 except Exception as e:
                     return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
-                shown = mask_proxy(new_proxy) or "band"
+                shown = "free auto pool" if new_proxy == PROXY_AUTO else (mask_proxy(new_proxy) or "band")
+                if new_proxy == PROXY_AUTO:
+                    POOL_EVT.set()
                 log("proxy update:", shown)
                 log_add({"event": "proxy", "msg": f"proxy: {shown}"})
                 # Playwright dusre thread se nahi chalta: yahan sirf flag, restart main loop karega
@@ -1513,5 +1780,6 @@ if __name__ == "__main__":
         log("proxy log scrub failed:", type(e).__name__)
     threading.Thread(target=loop_human if HUMAN else loop, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
+    threading.Thread(target=pool_loop, daemon=True).start()
     log("listening on", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

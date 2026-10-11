@@ -16,7 +16,7 @@ RUN set -x; \
        else echo "obscura install nahi hua, Chromium par chalega"; fi; \
     rm -f /tmp/obscura.tgz
 
-RUN pip install --no-cache-dir playwright
+RUN pip install --no-cache-dir playwright tzdata PySocks
 ENV CHROME_PATH=/usr/bin/chromium
 WORKDIR /app
 COPY app.py .
