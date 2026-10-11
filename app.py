@@ -27,6 +27,16 @@ OBSCURA_PORT = env_int("OBSCURA_PORT", 9222)
 OBSCURA_STEALTH = env_int("OBSCURA_STEALTH", 1) != 0
 JS_ON = env_int("JS_ENABLED", 1) != 0           # 0 daalo to Chrome me JavaScript band (RAM test)
 WAKE_RELOAD = env_int("WAKE_RELOAD_SEC", 45)    # wake page khud na khule to itne sec baad hi reload (5 sec wala reload band)
+# ---- insaan-jaisa mode (HUMAN_MODE=0 daalo to purana tareeka: har EVERY_MIN par sab apps)
+HUMAN = env_int("HUMAN_MODE", 1) != 0
+VISITS_30 = max(1, env_int("VISITS_PER_30MIN", 2))   # ek app par 30 min me kitni visit (average)
+GAP_JIT = max(0, min(90, env_int("GAP_JITTER_PCT", 70)))   # gap kitna idhar-udhar (%)
+DWELL_MIN = max(3, env_int("DWELL_MIN_SEC", 8))       # page par minimum rukna
+DWELL_MAX = max(DWELL_MIN + 1, env_int("DWELL_MAX_SEC", 35))
+INPAGE = env_int("INPAGE_REQ", 1) != 0                # page ke andar se same-site request
+INPAGE_MAX = max(1, env_int("INPAGE_MAX", 3))         # ek visit me max itni
+INPAGE_PATHS = [x.strip() for x in os.environ.get("INPAGE_PATHS", "/").split(",") if x.strip().startswith("/")] or ["/"]
+RETRY_MIN, RETRY_MAX = 60, 180                        # wake fail ho to itne sec baad dobara
 LOG_DAYS = env_int("LOG_DAYS", 3)
 COOKIE_DAYS = env_int("COOKIE_DAYS", 3)
 MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser restart hoga
@@ -193,9 +203,120 @@ def human_wiggle(page):
         page.mouse.wheel(0, random.randint(-200, 400))
 
 
+# ---- insaan-jaisa behaviour -------------------------------------------------
+VIEWPORTS = [(1366, 768), (1536, 864), (1440, 900), (1920, 1080), (1280, 720), (1600, 900), (1280, 800)]
+LEARNED = {}           # app url -> us page ne khud jo same-site GET (xhr/fetch) kiye, wahi hum dohrayenge
+BAD_WORDS = ("logout", "signout", "delete", "remove", "clear", "reset", "stream", "chat/completions", "generate", "send")
+JS_FETCH = """async (u)=>{const c=new AbortController();const t=setTimeout(()=>c.abort(),15000);
+try{const r=await fetch(u,{credentials:'include',cache:'no-store',signal:c.signal});await r.arrayBuffer();return r.status}
+catch(e){return -1}finally{clearTimeout(t)}}"""
+
+
+def rwait(page, lo, hi):
+    """Random ruko (sec). Beech ke chhote aur kabhi lambe wait zyada, taaki pattern na bane."""
+    page.wait_for_timeout(int(random.triangular(lo, hi, lo + (hi - lo) * random.random() ** 2) * 1000))
+
+
+def bezier_path(x0, y0, x1, y1):
+    """Seedhi line nahi, curve + halka kaanpna. (x, y) points ki list."""
+    dx, dy = x1 - x0, y1 - y0
+    dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+    bend = dist * random.uniform(0.08, 0.35)
+    c1 = (x0 + dx * random.uniform(0.15, 0.4) + random.uniform(-bend, bend), y0 + dy * random.uniform(0.15, 0.4) + random.uniform(-bend, bend))
+    c2 = (x0 + dx * random.uniform(0.6, 0.9) + random.uniform(-bend, bend), y0 + dy * random.uniform(0.6, 0.9) + random.uniform(-bend, bend))
+    n = max(10, min(55, int(dist / random.uniform(14, 30))))
+    pts = []
+    for i in range(1, n + 1):
+        t = i / n
+        t = t * t * (3 - 2 * t)                       # shuru/ant me dheema, beech me tez
+        a, b, c, d = (1 - t) ** 3, 3 * (1 - t) ** 2 * t, 3 * (1 - t) * t * t, t ** 3
+        pts.append((a * x0 + b * c1[0] + c * c2[0] + d * x1 + random.uniform(-1.4, 1.4),
+                    a * y0 + b * c1[1] + c * c2[1] + d * y1 + random.uniform(-1.4, 1.4)))
+    return pts
+
+
+def h_move(page, pos, vw, vh):
+    x1 = random.uniform(vw * 0.05, vw * 0.95)
+    y1 = random.uniform(vh * 0.08, vh * 0.92)
+    if pos.get("x") is None:
+        pos["x"], pos["y"] = random.uniform(vw * 0.2, vw * 0.8), random.uniform(vh * 0.2, vh * 0.8)
+    for (x, y) in bezier_path(pos["x"], pos["y"], x1, y1):
+        page.mouse.move(max(1, x), max(1, y))
+        if random.random() < 0.25:
+            page.wait_for_timeout(random.randint(3, 25))
+    pos["x"], pos["y"] = x1, y1
+    if random.random() < 0.35:                         # kahin ruk ke thoda hilna (hover)
+        for _ in range(random.randint(2, 5)):
+            pos["x"] += random.uniform(-6, 6)
+            pos["y"] += random.uniform(-5, 5)
+            page.mouse.move(max(1, pos["x"]), max(1, pos["y"]), steps=random.randint(1, 3))
+            page.wait_for_timeout(random.randint(40, 260))
+
+
+def h_scroll(page):
+    d = random.choice([1, 1, 1, -1])
+    for _ in range(random.randint(1, 4)):
+        page.mouse.wheel(0, d * random.randint(50, 420))
+        page.wait_for_timeout(random.randint(120, 1300))
+        if random.random() < 0.2:
+            d = -d
+
+
+def h_inpage_request(page, url):
+    """Page ke andar se same-site GET (jaise app khud karta hai). Chat/POST nahi bhejta, to AI kharcha nahi."""
+    cand = LEARNED.get(url) or []
+    path = random.choice(cand) if cand and random.random() < 0.75 else random.choice(INPAGE_PATHS)
+    try:
+        code = page.evaluate(JS_FETCH, path)
+    except Exception as e:
+        return f"{path}:err"
+    return f"{path}:{code}"
+
+
+def human_dwell(page, url, obs):
+    """Chhoti visit: random der rukna, mouse/scroll, aur beech me page ke andar se request."""
+    target = random.uniform(DWELL_MIN, DWELL_MAX)
+    if random.random() < 0.08:
+        target *= random.uniform(1.6, 2.4)             # kabhi kabhi zyada der
+    vw, vh = page.viewport_size["width"], page.viewport_size["height"]
+    pos = {"x": None, "y": None}
+    n_req = random.randint(1, INPAGE_MAX) if INPAGE else 0
+    req_at = sorted(random.uniform(0.15, 0.9) * target for _ in range(n_req))
+    reqs = []
+    d0 = time.time()
+    try:
+        rwait(page, 1.5, 7.0)                          # page khulte hi koi kuch nahi karta, pehle dekhta hai
+        while time.time() - d0 < target:
+            if req_at and time.time() - d0 >= req_at[0]:
+                req_at.pop(0)
+                reqs.append(h_inpage_request(page, url))
+                mem_mb()
+                continue
+            r = random.random()
+            if r < 0.50:
+                h_move(page, pos, vw, vh)
+            elif r < 0.75:
+                h_scroll(page)
+            elif r < 0.88:
+                rwait(page, 0.8, 4.5)                  # bas kuch der dekhna
+            else:
+                h_move(page, pos, vw, vh)
+                h_scroll(page)
+            rwait(page, 0.2, 2.5)
+        while req_at:                                  # request bachi ho to bhej do (har visit me kam se kam 1)
+            req_at.pop(0)
+            reqs.append(h_inpage_request(page, url))
+            rwait(page, 0.3, 1.5)
+    except Exception as e:
+        if not obs:
+            log("human_dwell ruka:", type(e).__name__)
+    return int(time.time() - d0), reqs
+
+
 def visit(browser, url):
     sp = state_path(url)
-    kw = dict(user_agent=UA, viewport={"width": 1366, "height": 768}, locale="en-US", timezone_id="Asia/Kolkata",
+    vp = random.choice(VIEWPORTS) if HUMAN else (1366, 768)
+    kw = dict(user_agent=UA, viewport={"width": vp[0], "height": vp[1]}, locale="en-US", timezone_id="Asia/Kolkata",
               java_script_enabled=JS_ON)
     had_cookies = False
     if os.path.exists(sp):
@@ -227,7 +348,8 @@ def visit(browser, url):
     if not obs:                               # obscura render nahi karta, route ki zaroorat nahi
         page.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
     t0, status, gate, first = time.time(), None, None, None
-    ok, dwell_done, reloads = False, 0, 0
+    ok, dwell_done, reloads, inpage = False, 0, 0, []
+    host = urlparse(url).hostname
     nav = {"status": None, "gate": None, "n": 0}
 
     def on_resp(r):                           # page khud navigate kare (wake page -> app) to yahan pata chalta hai
@@ -235,6 +357,20 @@ def visit(browser, url):
             if r.request.is_navigation_request() and r.frame == page.main_frame:
                 nav["status"], nav["gate"] = r.status, r.headers.get("x-blitz-gate")
                 nav["n"] += 1
+        except Exception:
+            pass
+
+    def on_req(rq):                           # app khud jo same-site GET (xhr/fetch) karta hai wo yaad rakho
+        try:
+            if rq.resource_type in ("xhr", "fetch") and rq.method == "GET":
+                pu = urlparse(rq.url)
+                low = rq.url.lower()
+                if pu.hostname == host and not any(b in low for b in BAD_WORDS):
+                    pth = pu.path + (("?" + pu.query) if pu.query else "")
+                    lst = LEARNED.setdefault(url, [])
+                    if pth and pth not in lst and len(pth) < 300:
+                        lst.append(pth)
+                        del lst[:-8]
         except Exception:
             pass
 
@@ -249,6 +385,7 @@ def visit(browser, url):
             return None, f"err:{type(e).__name__}"
 
     page.on("response", on_resp)
+    page.on("request", on_req)
     try:
         status, gate = load()                 # sirf ek baar kholo
         first = (status, gate)
@@ -267,7 +404,9 @@ def visit(browser, url):
                 status, gate = load()
                 seen, last_load = nav["n"], time.time()
                 ok = awake(status, gate)
-        if ok:
+        if ok and HUMAN:
+            dwell_done, inpage = human_dwell(page, url, obs)
+        elif ok:
             d0 = time.time()
             while time.time() - d0 < DWELL:         # page par asli insaan jaisa thoda ruko
                 page.wait_for_timeout(random.randint(3000, 7000))
@@ -291,9 +430,9 @@ def visit(browser, url):
             pass
     was_asleep = not (first and first[0] and first[0] < 400 and not first[1])
     res = {"url": url, "status": status, "gate": gate, "took": int(time.time() - t0), "ok": ok,
-           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads}
+           "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
-                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'}")
+                 f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage}")
     log_add(res)
     return res
 
@@ -456,28 +595,92 @@ def check_health():
         launch_browser(f"{age_h:.0f} ghante purana")
 
 
+def run_one(u):
+    """Ek app ko visit karo (browser crash par ek baar retry). Result dict ya None."""
+    for attempt in (1, 2):
+        try:
+            check_health()
+            return visit(get_browser(), u)
+        except Exception as e:
+            log("visit error:", u, type(e).__name__, str(e)[:120])
+            if STATUS["engine"] == "obscura":
+                obscura_failed(f"visit error {type(e).__name__}: {str(e)[:80]}")
+            try:
+                launch_browser(f"error: {type(e).__name__}")
+            except Exception as e2:
+                log("browser relaunch failed:", type(e2).__name__, str(e2)[:120])
+                break
+    log_add({"url": u, "ok": False, "status": None, "gate": "browser-error", "took": 0,
+             "was_asleep": True, "dwell": 0, "cookies": False})
+    return None
+
+
 def run_round(apps):
     for u in apps:
-        done = False
-        for attempt in (1, 2):
-            try:
-                check_health()
-                visit(get_browser(), u)
-                done = True
-                break
-            except Exception as e:
-                log("visit error:", u, type(e).__name__, str(e)[:120])
-                if STATUS["engine"] == "obscura":
-                    obscura_failed(f"visit error {type(e).__name__}: {str(e)[:80]}")
-                try:
-                    launch_browser(f"error: {type(e).__name__}")
-                except Exception as e2:
-                    log("browser relaunch failed:", type(e2).__name__, str(e2)[:120])
-                    break
-        if not done:
-            log_add({"url": u, "ok": False, "status": None, "gate": "browser-error", "took": 0,
-                     "was_asleep": True, "dwell": 0, "cookies": False})
+        run_one(u)
     mem_mb()
+
+
+def next_gap():
+    """Agli visit tak kitna ruko: 30 min me ~VISITS_30 visit, par har baar alag, kabhi jaldi kabhi der se."""
+    base = 1800.0 / VISITS_30
+    j = GAP_JIT / 100.0
+    g = random.uniform(base * (1 - j), base * (1 + j))
+    r = random.random()
+    if r < 0.12:
+        g *= random.uniform(0.4, 0.7)
+    elif r < 0.20:
+        g *= random.uniform(1.15, 1.5)
+    return max(120.0, g)
+
+
+def loop_human():
+    """Har app ka apna random time. Ek waqt par ek hi visit (RAM ke liye)."""
+    DUE = {}
+    last_prune = 0.0
+    while True:
+        apps = load_apps()
+        now = time.time()
+        for u in list(DUE):
+            if u not in apps:
+                DUE.pop(u)
+        for u in apps:
+            if u not in DUE:
+                DUE[u] = now + random.uniform(10, max(40, 1800.0 / VISITS_30 * 0.6))
+        if TRIGGER.is_set():                       # "Abhi visit karo" ya naya app add hua
+            TRIGGER.clear()
+            for u in apps:
+                DUE[u] = now + random.uniform(0, 15)
+        due_now = [u for u in apps if DUE.get(u, now + 1) <= now]
+        random.shuffle(due_now)
+        if due_now:
+            STATUS["running"] = True
+            for i, u in enumerate(due_now):
+                res = None
+                try:
+                    res = run_one(u)
+                except Exception as e:
+                    log("visit failed:", type(e).__name__, e)
+                    log_add({"event": "error", "msg": f"{type(e).__name__}: {e}"[:200]})
+                gap = random.uniform(RETRY_MIN, RETRY_MAX) if not (res and res.get("ok")) else next_gap()
+                DUE[u] = time.time() + gap
+                log(f"agli visit {u}: {int(gap)//60}m{int(gap)%60}s baad")
+                if i < len(due_now) - 1:
+                    TRIGGER.wait(timeout=random.uniform(5, 40))   # apps ke beech bhi random gap
+            STATUS["running"] = False
+            mem_mb()
+        if time.time() - last_prune > 600:
+            last_prune = time.time()
+            try:
+                prune_log()
+                n = prune_state(load_apps())
+                if n:
+                    log(f"purani cookie files hataayi: {n}")
+            except Exception as e:
+                log("prune failed:", e)
+        nxt = min(DUE.values()) if DUE else time.time() + 60
+        STATUS["next"] = nxt
+        TRIGGER.wait(timeout=max(2.0, min(30.0, nxt - time.time())) + random.random())
 
 
 def loop():
@@ -580,6 +783,10 @@ def dashboard():
         cb = sum(os.path.getsize(os.path.join(STATE_DIR, f)) for f in files)
     except OSError:
         files, cb = [], 0
+    if HUMAN:
+        mode_line = f"insaan mode: ~{VISITS_30} visit/30 min (random), page par {DWELL_MIN}-{DWELL_MAX}s, andar se request {'ON' if INPAGE else 'OFF'}"
+    else:
+        mode_line = f"gap {EVERY//60} min, page par ruko {DWELL}s"
     bs = STATUS["b_started"]
     if bs:
         ag = int(now - bs)
@@ -592,7 +799,7 @@ def dashboard():
 <title>Keepalive</title><style>{CSS}</style></head><body>
 <h1>Keepalive dashboard</h1>
 <div class="mut">Server chalu hua: {fmt_t(STATUS["started"])} ({up//3600}h {up%3600//60}m pehle) &middot; agla round: {nxt_s}
-&middot; gap {EVERY//60} min &middot; page par ruko {DWELL}s &middot; cookies: {len(files)} files, {cb//1024} KB</div>
+&middot; {mode_line} &middot; cookies: {len(files)} files, {cb//1024} KB</div>
 <div class="mut">Browser: {browser_line}</div>
 <div class="card"><h2 style="margin-top:0">Apps ({len(apps)})</h2>
 <table><tr><th>App</th><th>Abhi</th><th>Aakhri visit</th><th>24h me so raha tha</th><th></th></tr>{''.join(rows) or '<tr><td colspan=5 class="mut">Koi app nahi. Neeche se jodo.</td></tr>'}</table>
@@ -703,7 +910,7 @@ if __name__ == "__main__":
         log(f"ADMIN_PASSWORD set nahi hai. Is baar ka password: {ADMIN_PASS}  (user: {ADMIN_USER}). "
             "Render Environment me ADMIN_PASSWORD daalo.")
     log_add({"event": "start"})
-    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=loop_human if HUMAN else loop, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
     log("listening on", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
