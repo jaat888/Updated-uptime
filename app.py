@@ -1425,6 +1425,7 @@ def human_dwell(page, url, obs, touch):
 
 def visit(browser, url, direct=False):
     STATUS["visit_kinds"] = {}
+    STATUS["visit_anon"] = 0.0
     STATUS["visit_peak"] = STATUS["visit_py"] = STATUS["visit_chrome"] = 0.0     # peak wake + reload + dwell, poori visit ka
     _p0 = time.time()
     px, reused = pool_pick(url) if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else (None, False)
@@ -1610,7 +1611,7 @@ def visit(browser, url, direct=False):
            "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android"),
            "mem": int(STATUS.get("visit_peak") or 0),
            "py": int(STATUS.get("visit_py") or 0), "chrome": int(STATUS.get("visit_chrome") or 0),
-           "procs": STATUS.get("visit_kinds") or {}, "base_procs": base_kinds, "cv": STATUS.get("chrome_full"), "headed": HEADED,
+           "anon": int(STATUS.get("visit_anon") or 0), "procs": STATUS.get("visit_kinds") or {}, "base_procs": base_kinds, "cv": STATUS.get("chrome_full"), "headed": HEADED,
            "base": int(base), "base_py": int(base_py), "tz": fp.get("timezone_id"),
            "geo_ms": geo_ms, "pick_ms": pick_ms, "tried": PICK_INFO["tried"], "pool": pool_good_n(),
            "bage": int((time.time() - (STATUS["b_started"] or time.time())) / 60), "restarts": STATUS["restarts"]}
@@ -1644,7 +1645,7 @@ def mem_mb():
             if pp in mine and pid not in mine:
                 mine.add(pid)
                 changed = True
-    tot, py_kb = 0, 0
+    tot, py_kb, anon_kb = 0, 0, 0
     kinds = {}
     for pid in mine:
         got = False
@@ -1655,6 +1656,8 @@ def mem_mb():
                     if line.startswith("Pss:"):
                         tot += int(line.split()[1])
                         got = True
+                    elif line.startswith("Pss_Anon:"):
+                        anon_kb += int(line.split()[1])
                         break
         except OSError:
             pass
@@ -1681,10 +1684,12 @@ def mem_mb():
                 pass
     mb = tot / 1024
     py = py_kb / 1024
+    STATUS["anon_now"] = anon_kb / 1024
     STATUS["mem_now"], STATUS["py_now"], STATUS["chrome_now"] = mb, py, max(0.0, mb - py)
     if mb > STATUS.get("visit_peak", 0):
         STATUS["visit_peak"] = mb
         STATUS["visit_kinds"] = {k: int(v / 1024) for k, v in kinds.items()}
+        STATUS["visit_anon"] = STATUS.get("anon_now", 0)
         STATUS["visit_py"], STATUS["visit_chrome"] = py, max(0.0, mb - py)
     if mb > STATUS["mem_peak"]:
         STATUS["mem_peak"] = mb
@@ -2158,6 +2163,8 @@ def _log_row(e):
     if e.get("mem"):
         split = f' (Python {e["py"]} + Chrome {e["chrome"]})' if "py" in e else ""
         rows.append(_kv("RAM peak", f'{e["mem"]} MB{split}'))
+    if e.get("anon"):
+        rows.append(_kv("Anon RAM (Render yahi ginta hai)", f'{e["anon"]} MB'))
     if e.get("procs"):
         rows.append(_kv("Process RAM", esc(" ".join(f"{k}={v}" for k, v in sorted(e["procs"].items(), key=lambda x: -x[1])))))
     if e.get("base_procs"):
