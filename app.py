@@ -4,7 +4,7 @@
 Dashboard: "/" (password), apps add/delete, 3-din ka log. "/ping" public (uptime bot ke liye).
 Cookies har app ke liye disk par save hoti hain aur purani apne-aap delete.
 """
-import os, re, sys, time, json, random, threading, urllib.request, html, hmac, base64, hashlib, secrets, urllib.error
+import gzip, os, re, sys, time, json, random, threading, urllib.request, html, hmac, base64, hashlib, secrets, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -294,7 +294,7 @@ def proxy_cfg():
 # Har POOL_REFRESH_MIN (default 30) min me list laao, POOL_TEST_COUNT (default 150) random proxy test karo,
 # sabse tez POOL_KEEP bachao. Har visit inme se random (tez wale zyada) chunta hai.
 # Sirf Chromium engine me chalta hai (Obscura me proxy launch par fix hoti hai).
-POOL_AUTO_ENV = env_int("FREE_PROXY_AUTO", 0) != 0
+POOL_AUTO_ENV = env_int("FREE_PROXY_AUTO", 1) != 0   # disk reset ke baad bhi Free auto se hi shuru (server IP se nahi)
 POOL_SOURCES = [x.strip() for x in os.environ.get("POOL_SOURCES", ",".join([
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -342,6 +342,18 @@ def scanner_cfg():
                 return "", ""
             if d.get("mode") == "remote" and d.get("url"):
                 return str(d["url"]).rstrip("/"), str(d.get("key") or "")
+    except (OSError, ValueError):
+        pass
+    return SCANNER_URL, SCANNER_KEY
+
+
+def scanner_alt():
+    """Dashboard me save kiya Cloudflare (mode local ho tab bhi) ya env wala. Render ka khud ka scan na chale to isse list lo."""
+    try:
+        with open(SCANNER_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("url"):
+            return str(d["url"]).rstrip("/"), str(d.get("key") or "")
     except (OSError, ValueError):
         pass
     return SCANNER_URL, SCANNER_KEY
@@ -679,10 +691,10 @@ def pool_refresh(deadline=None, limit=None):
             POOL["prog"] = None
 
 
-def pool_sync_scanner():
+def pool_sync_scanner(url=None, key=None):
     """Scanner service se tez proxy ki list lo (khud test nahi, RAM bachti hai). Fail ho to purani list rakho."""
     try:
-        s_url, s_key = scanner_cfg()
+        s_url, s_key = (url, key or "") if url else scanner_cfg()
         if not s_url:
             return
         d = scanner_fetch(s_url, s_key, timeout=60)               # scanner so raha ho to jaagne me time lagta hai
@@ -729,6 +741,11 @@ def pool_loop():
                     POOL_EVT.clear()
                     log(f"pool: {POOL_START_TEST} proxy ka scan shuru, tab tak visit ruki hain")
                     pool_refresh(limit=POOL_START_TEST)
+                    if pool_good_n() < POOL_MIN_READY:
+                        a_url, a_key = scanner_alt()
+                        if a_url:                                   # Render khud na dhoondh paye to Cloudflare se list
+                            log("pool: Render ke scan se kam proxy mile, Cloudflare scanner se list le raha hoon")
+                            pool_sync_scanner(a_url, a_key)
                     if pool_good_n() >= POOL_MIN_READY or (POOL_STATE.get("warm") and pool_good_n() >= 1):
                         POOL_STATE["warm"] = True
                         log_add({"event": "proxy", "msg": f"pool tayyar ({pool_good_n()} proxy), visit shuru"})
@@ -2161,6 +2178,15 @@ def dashboard():
                      f'{prog["good"]} chale &middot; {el//60}m{el%60}s</div><div class="bar"><i style="width:{p}%"></i></div>')
     elif busy:
         prog_html = '<div class="mu" style="margin-top:8px">Scan shuru ho raha hai (list download)...</div>'
+    if BACKUP_URL:
+        ok_t = fmt_t(BACKUP["last_ok"]) if BACKUP["last_ok"] else "abhi tak nahi"
+        backup_html = (f'<div>{_chip("ON", "g") if not BACKUP["err"] else _chip("ERROR: " + esc(BACKUP["err"]), "r")}'
+                       f'<span class="mu">aakhri save: {ok_t} &middot; {BACKUP["size"] // 1024} KB'
+                       f'{" &middot; restore: " + esc(BACKUP["restored"]) if BACKUP["restored"] else ""}</span></div>'
+                       '<form method="post" action="/backup"><div class="btns"><button name="act" value="save">Abhi backup lo</button>'
+                       '<button name="act" value="restore" class="grey" onclick="return confirm(\'Backup se wapas laun? Abhi ka data badal jayega.\')">Restore karo</button></div></form>')
+    else:
+        backup_html = f'{_chip("OFF", "r")}<span class="mu">Render env me <code>BACKUP_URL</code> daalo (apna backup link).</span>'
     mode_line = (f"insaan mode &middot; 30 min me {VISITS_MIN}-{VISITS_MAX} visit &middot; page par {DWELL_MIN}-{DWELL_MAX}s"
                  if HUMAN else f"har {EVERY//60} min &middot; page par {DWELL}s")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2190,6 +2216,9 @@ def dashboard():
   <div class="btns"><button name="act" value="remote">Cloudflare use karo</button><button name="act" value="local" class="grey">Render khud test kare</button></div>
 </form>
 <div class="mu" style="margin-top:8px">Dono button Free auto bhi on kar dete hain. Cloudflare ka URL/password pehle check hota hai. Password dikhta nahi; box khali = purana.</div></div>
+<div class="card"><h2>Backup</h2>
+{backup_html}
+<div class="mu" style="margin-top:6px">Apps, proxy settings, Cloudflare setting, log, cookies aur proxy pool is backup me jaate hain; disk reset par apne aap wapas aate hain.</div></div>
 <div class="card"><h2>Log <a class="mu" href="/log.txt">download</a></h2>{''.join(logs) or '<div class="mu">Abhi log khali hai.</div>'}</div>
 <div class="mu">Render free ka disk restart par saaf hota hai; apps list <code>APP_URLS</code> se wapas banegi.</div>
 <script>
@@ -2261,11 +2290,25 @@ class H(BaseHTTPRequestHandler):
         val = (form.get("url") or [""])[0]
         path = urlparse(self.path).path
         msg = ""
+        if path == "/backup":
+            act = (form.get("act") or [""])[0]
+            if not BACKUP_URL:
+                return self._send(400, "BACKUP_URL Render env me set nahi hai.", "text/plain; charset=utf-8")
+            if act == "restore":
+                try:
+                    backup_restore()
+                except Exception as e:
+                    return self._send(400, f"Restore nahi hua: {type(e).__name__} {str(e)[:100]}", "text/plain; charset=utf-8")
+                POOL_EVT.set()
+            elif act == "save":
+                if not backup_save():
+                    return self._send(400, f"Backup nahi hua: {BACKUP['err']}", "text/plain; charset=utf-8")
+            return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
         if path == "/scanner":
             act = (form.get("act") or [""])[0]
             if act == "local":
                 try:
-                    save_scanner("local")
+                    save_scanner("local", *scanner_alt())
                 except Exception as e:
                     return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
                 if not proxy_auto():
@@ -2366,11 +2409,183 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
+
+# ================= Backup (BACKUP_URL env): disk reset hone par sab wapas =================
+BACKUP_URL = os.environ.get("BACKUP_URL", "").strip()          # SECRET: https://.../p/<key>  (sirf Render env me, GitHub me kabhi nahi); /sql apne aap jud jata hai
+BACKUP_EVERY = max(120, env_int("BACKUP_EVERY_SEC", 600))
+BACKUP = {"last_ok": 0.0, "err": "", "size": 0, "method": "", "restored": ""}
+_SMALL = ("apps.json", "proxy.txt", "scanner.json")
+
+
+def _backup_collect():
+    files = {}
+    for root, _d, names in os.walk(DATA):
+        for n in names:
+            if n.endswith(".tmp"):
+                continue
+            p = os.path.join(root, n)
+            try:
+                if os.path.getsize(p) <= 8 * 1024 * 1024:
+                    with open(p, "rb") as f:
+                        files[os.path.relpath(p, DATA)] = f.read()
+            except OSError:
+                pass
+    with POOL_LOCK:
+        good = [{"hp": g["hp"], "ms": g["ms"], "cc": POOL["cc"].get(g["hp"])} for g in POOL["good"][:100]]
+    files["pool.json"] = json.dumps({"t": time.time(), "good": good}).encode()
+    return files
+
+
+_SCHEMA = "CREATE TABLE IF NOT EXISTS kv(name TEXT NOT NULL, part INTEGER NOT NULL, data TEXT NOT NULL, t REAL, PRIMARY KEY(name, part))"
+_CHUNK = 200_000
+
+
+def _sql_url():
+    u = BACKUP_URL.rstrip("/")
+    return u if u.endswith("/sql") else u + "/sql"
+
+
+def _sql_post(payload, url=None, timeout=60):
+    req = urllib.request.Request(url or _sql_url(), data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "keepalive"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(60 * 1024 * 1024).decode("utf-8", "replace")
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _sql_rows(resp):
+    """Alag-alag response shape se rows nikalo: list | {rows|results|data: [...]}; row dict ya list ho sakti hai."""
+    if isinstance(resp, dict):
+        for k in ("rows", "results", "data", "result"):
+            if isinstance(resp.get(k), list):
+                resp = resp[k]
+                break
+            if isinstance(resp.get(k), dict) and isinstance(resp[k].get("rows"), list):
+                resp = resp[k]["rows"]
+                break
+    if isinstance(resp, list) and resp and isinstance(resp[0], dict) and isinstance(resp[0].get("rows"), list):
+        resp = resp[0]["rows"]
+    out = []
+    for r in resp if isinstance(resp, list) else []:
+        if isinstance(r, dict):
+            out.append((r.get("name"), r.get("part"), r.get("data")))
+        elif isinstance(r, (list, tuple)) and len(r) >= 3:
+            out.append((r[0], r[1], r[2]))
+    return out
+
+
+def _err_text(e):
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            return f"HTTP {e.code}: {e.read(200).decode('utf-8', 'replace')}"
+        except Exception:
+            return f"HTTP {e.code}"
+    return type(e).__name__
+
+
+def backup_save():
+    if not BACKUP_URL:
+        return False
+    try:
+        _sql_post({"script": _SCHEMA})
+        now, batch = time.time(), [{"sql": "DELETE FROM kv"}]
+        for name, raw in _backup_collect().items():
+            enc = base64.b64encode(gzip.compress(raw)).decode()
+            for i in range(0, max(1, len(enc)), _CHUNK):
+                batch.append({"sql": "INSERT INTO kv(name, part, data, t) VALUES(?,?,?,?)",
+                              "params": [name, i // _CHUNK, enc[i:i + _CHUNK], now]})
+        _sql_post({"batch": batch})                         # ek transaction: aadha save nahi hoga
+        BACKUP.update(last_ok=time.time(), err="", size=sum(len(x["params"][2]) for x in batch[1:]), method="SQL")
+        return True
+    except Exception as e:
+        BACKUP["err"] = _err_text(e)[:160]
+        return False
+
+
+def backup_restore():
+    """Backup (SQL) se files wapas. -> kitni files. Khali/galat ho to ValueError."""
+    try:
+        rows = _sql_rows(_sql_post({"sql": "SELECT name, part, data FROM kv ORDER BY name, part"}))
+    except urllib.error.HTTPError as e:
+        if "no such table" in _err_text(e).lower():
+            raise ValueError("backup abhi khali hai")
+        raise
+    parts = {}
+    for name, part, data in rows:
+        if isinstance(name, str) and isinstance(data, str):
+            parts.setdefault(name, []).append((int(part or 0), data))
+    if not parts:
+        raise ValueError("backup abhi khali hai")
+    base, n = os.path.realpath(DATA), 0
+    for rel, ps in parts.items():
+        raw = gzip.decompress(base64.b64decode("".join(d for _p, d in sorted(ps))))
+        if rel == "pool.json":
+            d = json.loads(raw.decode())
+            if time.time() - float(d.get("t", 0)) < 3 * 3600:
+                good = [{"hp": g["hp"], "ms": int(g.get("ms", 3000)), "t": time.time()} for g in d.get("good", [])
+                        if isinstance(g, dict) and check_proxy(g.get("hp"))]
+                with POOL_LOCK:
+                    POOL["good"] = good
+                    for g in d.get("good", []):
+                        if g.get("cc"):
+                            POOL["cc"][g["hp"]] = g["cc"]
+                    POOL["note"] = f"backup se {len(good)} proxy (purane ho sakte hain)"
+                    POOL["updated"] = time.time()
+                if len(good) >= POOL_MIN_READY:
+                    POOL_STATE["warm"] = True
+            continue
+        dest = os.path.realpath(os.path.join(DATA, rel))
+        if not dest.startswith(base + os.sep):              # path se bahar likhna mana
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest + ".tmp", "wb") as f:
+            f.write(raw)
+        os.replace(dest + ".tmp", dest)
+        n += 1
+    BACKUP["restored"] = f"{n} files, {fmt_t(time.time())}"
+    return n
+
+
+def backup_boot():
+    os.makedirs(DATA, exist_ok=True)
+    if BACKUP_URL and not os.path.exists(APPS_FILE):                # naya/khali disk: pehle backup se wapas
+        try:
+            log("backup: disk khali hai, backup se wapas la raha hoon:", backup_restore(), "files")
+        except Exception as e:
+            BACKUP["err"] = f"restore: {type(e).__name__}"
+            log("backup restore nahi hua:", type(e).__name__, str(e)[:100])
+
+
+def backup_loop():
+    def small():
+        h = hashlib.sha1()
+        for n in _SMALL:
+            try:
+                with open(os.path.join(DATA, n), "rb") as f:
+                    h.update(f.read())
+            except OSError:
+                pass
+        return h.hexdigest()
+    last_small, last_full = None, 0.0
+    while BACKUP_URL:
+        try:
+            sm, now = small(), time.time()
+            if sm != last_small or now - last_full >= BACKUP_EVERY:
+                if backup_save():
+                    last_small, last_full = sm, now
+                else:
+                    last_full = now - BACKUP_EVERY + 90               # 90 sec me dobara
+        except Exception as e:
+            BACKUP["err"] = type(e).__name__
+        time.sleep(20)
+
+
 if __name__ == "__main__":
     if not ADMIN_PASS:
         ADMIN_PASS = secrets.token_urlsafe(9)
         log(f"ADMIN_PASSWORD set nahi hai. Is baar ka password: {ADMIN_PASS}  (user: {ADMIN_USER}). "
             "Render Environment me ADMIN_PASSWORD daalo.")
+    backup_boot()
     log_add({"event": "start"})
     try:
         scrub_proxy_log()
@@ -2379,5 +2594,6 @@ if __name__ == "__main__":
     threading.Thread(target=loop_human if HUMAN else loop, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
     threading.Thread(target=pool_loop, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
     log("listening on", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
