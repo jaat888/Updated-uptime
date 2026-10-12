@@ -1424,6 +1424,7 @@ def human_dwell(page, url, obs, touch):
 
 
 def visit(browser, url, direct=False):
+    STATUS["visit_kinds"] = {}
     STATUS["visit_peak"] = STATUS["visit_py"] = STATUS["visit_chrome"] = 0.0     # peak wake + reload + dwell, poori visit ka
     _p0 = time.time()
     px, reused = pool_pick(url) if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else (None, False)
@@ -1435,6 +1436,7 @@ def visit(browser, url, direct=False):
         geo_ms = int((time.time() - _g0) * 1000)
     base = mem_mb()                                     # visit shuru hone se pehle ki RAM (fresh browser ka asli base)
     base_py = STATUS.get("py_now", 0)
+    base_kinds = dict(STATUS.get("visit_kinds") or {})
     sp = state_path(url, px)                            # is proxy IP ki apni cookie file
     wake_max = (REUSE_WAKE_MAX if reused else POOL_WAKE_MAX) if px else WAKE_MAX   # purana chala hua proxy: zyada sabr
     fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
@@ -1608,6 +1610,7 @@ def visit(browser, url, direct=False):
            "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android"),
            "mem": int(STATUS.get("visit_peak") or 0),
            "py": int(STATUS.get("visit_py") or 0), "chrome": int(STATUS.get("visit_chrome") or 0),
+           "procs": STATUS.get("visit_kinds") or {}, "base_procs": base_kinds, "cv": STATUS.get("chrome_full"), "headed": HEADED,
            "base": int(base), "base_py": int(base_py), "tz": fp.get("timezone_id"),
            "geo_ms": geo_ms, "pick_ms": pick_ms, "tried": PICK_INFO["tried"], "pool": pool_good_n(),
            "bage": int((time.time() - (STATUS["b_started"] or time.time())) / 60), "restarts": STATUS["restarts"]}
@@ -1642,6 +1645,7 @@ def mem_mb():
                 mine.add(pid)
                 changed = True
     tot, py_kb = 0, 0
+    kinds = {}
     for pid in mine:
         got = False
         before = tot
@@ -1662,11 +1666,25 @@ def mem_mb():
                 pass
         if pid == me:
             py_kb = tot - before
+        else:                                   # Chromium process ka type (browser/renderer/gpu/network...) cmdline se
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().decode("utf-8", "replace")
+                m = re.search(r"--type=([a-z\-]+)", cmd)
+                k = m.group(1) if m else "browser"
+                if k == "utility" and "network" in cmd:
+                    k = "network"
+                elif k == "utility" and "storage" in cmd:
+                    k = "storage"
+                kinds[k] = kinds.get(k, 0) + (tot - before)
+            except OSError:
+                pass
     mb = tot / 1024
     py = py_kb / 1024
     STATUS["mem_now"], STATUS["py_now"], STATUS["chrome_now"] = mb, py, max(0.0, mb - py)
     if mb > STATUS.get("visit_peak", 0):
         STATUS["visit_peak"] = mb
+        STATUS["visit_kinds"] = {k: int(v / 1024) for k, v in kinds.items()}
         STATUS["visit_py"], STATUS["visit_chrome"] = py, max(0.0, mb - py)
     if mb > STATUS["mem_peak"]:
         STATUS["mem_peak"] = mb
@@ -2140,6 +2158,12 @@ def _log_row(e):
     if e.get("mem"):
         split = f' (Python {e["py"]} + Chrome {e["chrome"]})' if "py" in e else ""
         rows.append(_kv("RAM peak", f'{e["mem"]} MB{split}'))
+    if e.get("procs"):
+        rows.append(_kv("Process RAM", esc(" ".join(f"{k}={v}" for k, v in sorted(e["procs"].items(), key=lambda x: -x[1])))))
+    if e.get("base_procs"):
+        rows.append(_kv("Process RAM (shuru me)", esc(" ".join(f"{k}={v}" for k, v in sorted(e["base_procs"].items(), key=lambda x: -x[1])))))
+    if e.get("cv"):
+        rows.append(_kv("Chromium", esc(e["cv"]) + (" headed" if e.get("headed") else " headless")))
     if e.get("base"):
         rows.append(_kv("RAM shuru me", f'{e["base"]} MB (Python {e.get("base_py", 0)})'))
     if "pick_ms" in e:
