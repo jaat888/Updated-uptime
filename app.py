@@ -59,6 +59,8 @@ STATE_DIR = os.path.join(DATA, "state")
 APPS_FILE = os.path.join(DATA, "apps.json")
 LOG_FILE = os.path.join(DATA, "log.jsonl")
 CHROME = os.environ.get("CHROME_PATH", "/usr/bin/chromium")
+# 1 = Playwright ka halka chromium-headless-shell (RAM kam). Default 0 = abhi wala /usr/bin/chromium. Dockerfile me install line chahiye.
+USE_SHELL = env_int("USE_HEADLESS_SHELL", 0) != 0
 PORT = env_int("PORT", 10000)
 SELF = os.environ.get("RENDER_EXTERNAL_URL", "")
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()   # env se default
@@ -1425,6 +1427,7 @@ def human_dwell(page, url, obs, touch):
 
 def visit(browser, url, direct=False):
     STATUS["visit_kinds"] = {}
+    STATUS["visit_pss"] = 0.0
     STATUS["visit_anon"] = 0.0
     STATUS["visit_peak"] = STATUS["visit_py"] = STATUS["visit_chrome"] = 0.0     # peak wake + reload + dwell, poori visit ka
     _p0 = time.time()
@@ -1611,7 +1614,7 @@ def visit(browser, url, direct=False):
            "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android"),
            "mem": int(STATUS.get("visit_peak") or 0),
            "py": int(STATUS.get("visit_py") or 0), "chrome": int(STATUS.get("visit_chrome") or 0),
-           "anon": int(STATUS.get("visit_anon") or 0), "procs": STATUS.get("visit_kinds") or {}, "base_procs": base_kinds, "cv": STATUS.get("chrome_full"), "headed": HEADED,
+           "anon": int(STATUS.get("visit_anon") or 0), "pss": int(STATUS.get("visit_pss") or 0), "msrc": STATUS.get("mem_src"), "procs": STATUS.get("visit_kinds") or {}, "base_procs": base_kinds, "cv": STATUS.get("chrome_full"), "headed": HEADED,
            "base": int(base), "base_py": int(base_py), "tz": fp.get("timezone_id"),
            "geo_ms": geo_ms, "pick_ms": pick_ms, "tried": PICK_INFO["tried"], "pool": pool_good_n(),
            "bage": int((time.time() - (STATUS["b_started"] or time.time())) / 60), "restarts": STATUS["restarts"]}
@@ -1621,6 +1624,29 @@ def visit(browser, url, direct=False):
                  f"ram={res['mem']}MB(py={res['py']}+chrome={res['chrome']}) base={res['base']}MB pick={pick_ms}ms/{PICK_INFO['tried']} geo={geo_ms}ms tz={fp['timezone_id']}")
     log_add(res)
     return res
+
+
+def cgroup_mb():
+    """Container ki memory jo Render ginta hai (cgroup v2/v1): usage - inactive file cache (working set). Na mile to None."""
+    for cur, stat, key in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
+                           ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")):
+        try:
+            with open(cur) as f:
+                use = int(f.read().strip())
+            inactive = 0
+            try:
+                with open(stat) as f:
+                    for line in f:
+                        k, _, v = line.partition(" ")
+                        if k == key:
+                            inactive = int(v)
+                            break
+            except (OSError, ValueError):
+                pass
+            return max(0.0, (use - inactive) / 1048576)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def mem_mb():
@@ -1682,9 +1708,19 @@ def mem_mb():
                 kinds[k] = kinds.get(k, 0) + (tot - before)
             except OSError:
                 pass
-    mb = tot / 1024
+    pss = tot / 1024
     py = py_kb / 1024
     STATUS["anon_now"] = anon_kb / 1024
+    STATUS["pss_now"] = pss
+    cg = cgroup_mb()                               # Render yahi ginta hai; limit/restart isi par
+    if cg is not None:
+        mb, STATUS["mem_src"] = cg, "cgroup"
+    elif anon_kb:
+        mb, STATUS["mem_src"] = anon_kb / 1024, "anon"
+    else:
+        mb, STATUS["mem_src"] = pss, "pss"
+    if pss > STATUS.get("visit_pss", 0):
+        STATUS["visit_pss"] = pss
     STATUS["mem_now"], STATUS["py_now"], STATUS["chrome_now"] = mb, py, max(0.0, mb - py)
     if mb > STATUS.get("visit_peak", 0):
         STATUS["visit_peak"] = mb
@@ -1747,6 +1783,18 @@ def obscura_failed(why):
     log_add({"event": "browser", "msg": f"Obscura fail, Chromium par wapas: {why}"[:200]})
 
 
+def _chromium_launch(**k):
+    """USE_HEADLESS_SHELL=1 ho to pehle headless-shell; na chale to apne-aap /usr/bin/chromium par wapas."""
+    if k.get("headless") and USE_SHELL and not STATUS.get("shell_failed"):
+        try:
+            return PW.chromium.launch(**k)
+        except Exception as e:
+            STATUS["shell_failed"] = True
+            log("headless-shell nahi chala, /usr/bin/chromium par wapas:", type(e).__name__, str(e)[:120])
+            log_add({"event": "browser", "msg": f"headless-shell fail ({type(e).__name__}), full Chromium par wapas"})
+    return PW.chromium.launch(executable_path=CHROME, **k)
+
+
 def launch_browser(reason):
     """Browser ek baar kholo aur chalta rakho. Sirf zaroorat par (memory, umar, crash) restart."""
     global PW, BROWSER
@@ -1776,7 +1824,7 @@ def launch_browser(reason):
         kw = {"proxy": pc} if pc else {}
         if pc:
             log("proxy ON:", pc["server"])
-        BROWSER = PW.chromium.launch(executable_path=CHROME, headless=not HEADED, timeout=120000, args=[
+        BROWSER = _chromium_launch(headless=not HEADED, timeout=120000, args=[
             "--no-sandbox", "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
             "--enable-low-end-device-mode",
@@ -2163,8 +2211,8 @@ def _log_row(e):
     if e.get("mem"):
         split = f' (Python {e["py"]} + Chrome {e["chrome"]})' if "py" in e else ""
         rows.append(_kv("RAM peak", f'{e["mem"]} MB{split}'))
-    if e.get("anon"):
-        rows.append(_kv("Anon RAM (Render yahi ginta hai)", f'{e["anon"]} MB'))
+    if e.get("pss"):
+        rows.append(_kv("RAM naap", f'{e.get("msrc", "?")} (PSS {e["pss"]} MB, anon {e.get("anon", 0)} MB)'))
     if e.get("procs"):
         rows.append(_kv("Process RAM", esc(" ".join(f"{k}={v}" for k, v in sorted(e["procs"].items(), key=lambda x: -x[1])))))
     if e.get("base_procs"):
