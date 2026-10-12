@@ -307,11 +307,11 @@ POOL_SOURCES = [x.strip() for x in os.environ.get("POOL_SOURCES", ",".join([
 # iplocate/free-proxy-list: countries/<CC>/proxies.txt (GitHub par dekh kar confirm kiya)
 POOL_COUNTRIES = [c.strip().upper() for c in os.environ.get("POOL_COUNTRIES", "IN,US,DE,GB,SG,NL,FR,BR,ID").split(",") if c.strip()]
 IPLOC = "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/countries/"
-POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 30)) * 60
-POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 150))
+POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 60)) * 60
+POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 60))
 POOL_KEEP = max(1, env_int("POOL_KEEP", 40))
 POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
-POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 20)))     # ek saath itne test (40 se upar nahi)
+POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 35)))     # ek saath itne test (40 se upar nahi)
 POOL_BATCH = max(10, env_int("POOL_BATCH", 60))                  # itne proxy ek saath, phir RAM check
 BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0      # visit ke baad Chromium band (RAM khali), agli visit par phir khulega
 IDLE_REASON = "idle ke baad"
@@ -319,12 +319,15 @@ POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 100)                        # proxy se 
 POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 430)               # itni RAM (MB) se upar ho to test ruk jata hai
 # ---- khali time me scan: agli visit tak jitna time bacha, utne me proxy test (max POOL_TEST_MAX)
 POOL_IDLE = env_int("POOL_IDLE_SCAN", 1) != 0
-POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 1000))                 # ek khali-window me max itne proxy
-POOL_IDLE_EVERY = max(2, env_int("POOL_IDLE_EVERY_MIN", 15)) * 60       # do idle scan ke beech kam se kam itna gap
+POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 120))                 # ek khali-window me max itne proxy
+POOL_IDLE_EVERY = max(2, env_int("POOL_IDLE_EVERY_MIN", 30)) * 60       # do idle scan ke beech kam se kam itna gap
 POOL_IDLE_MIN_WIN = env_int("POOL_IDLE_MIN_WINDOW_SEC", 90)            # agli visit me itna time ho tabhi scan shuru
 POOL_IDLE_MARGIN = env_int("POOL_IDLE_MARGIN_SEC", 40)                 # agli visit se itna pehle scan band
-POOL_KEEP_AGE = env_int("POOL_KEEP_AGE_MIN", 120) * 60                 # purane achhe proxy itni der pool me rakho
-POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 0)                      # 0 = roz ki koi limit nahi (number daalo to utne test roz)
+POOL_KEEP_AGE = env_int("POOL_KEEP_AGE_MIN", 120) * 60  # 2 ghante se purana proxy delete
+POOL_ENOUGH = max(3, env_int("POOL_ENOUGH", 25))                       # itne chalte proxy mil jayein to test wahin ruk jaye
+POOL_TOPUP = max(3, env_int("POOL_TOPUP_BELOW", 20))                   # pool me isse kam proxy ho tabhi naya scan
+#                 # purane achhe proxy itni der pool me rakho
+POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 300)                      # 0 = roz ki koi limit nahi (number daalo to utne test roz)
 POOL_RETEST_SEC = 3600                                                 # ek proxy ko 1 ghante me dobara test nahi
 SCANNER_URL = os.environ.get("SCANNER_URL", "").strip().rstrip("/")     # alag scanner service ka URL (set ho to proxy test yahan nahi hoga)
 SCANNER_KEY = os.environ.get("SCANNER_KEY", "").strip()
@@ -397,7 +400,7 @@ POOL_LIST_TTL = 1800                                                   # GitHub 
 POOL_STATE = {"tested_at": {}, "day": "", "day_n": 0, "list": None, "list_t": 0.0}
 POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
 POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 0) != 0   # 1 = proxy fail/pool khali ho to server ke IP se visit (default band: server IP kabhi nahi)
-POOL_START_TEST = max(10, env_int("POOL_START_TEST", 600))        # shuru me itne proxy pehle test, tabhi visit shuru
+POOL_START_TEST = max(10, env_int("POOL_START_TEST", 150))        # shuru me itne proxy pehle test, tabhi visit shuru
 POOL_MIN_READY = max(1, env_int("POOL_MIN_READY", 3))             # kam se kam itne chalte proxy mile to visit shuru
 POOL_RETRIES = max(0, env_int("POOL_RETRIES", 2))                 # proxy se visit fail ho to itni baar naye proxy se turant dobara
 POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
@@ -635,9 +638,12 @@ def pool_refresh(deadline=None, limit=None):
         for i in range(0, len(sample), POOL_BATCH):
             if deadline:
                 nxt = STATUS.get("next") or deadline
-                if STATUS["running"] or time.time() + est > min(deadline, nxt - POOL_IDLE_MARGIN):
+                if STATUS["running"] or STATUS.get("visiting") or time.time() + est > min(deadline, nxt - POOL_IDLE_MARGIN):
                     why = " (agli visit paas aa gayi, yahin roka)"
                     break
+            if chrome_busy():   # Chrome chal raha hai: scan yahin roko
+                why = " (Chrome chal raha hai, yahin roka)"
+                break
             waited = 0
             while mem_mb() > POOL_MEM_PAUSE and waited < 90:      # RAM zyada hai: thoda ruko, crash se bachao
                 time.sleep(5)
@@ -662,6 +668,9 @@ def pool_refresh(deadline=None, limit=None):
                 ta[x] = time.time()
             import gc
             gc.collect()
+            if len(good) >= POOL_ENOUGH:
+                why = " (kaafi proxy mil gaye, test band)"
+                break
         # purane achhe proxy (jo bad mark nahi hue aur bahut purane nahi) naye ke saath rakho
         now = time.time()
         with POOL_LOCK:
@@ -753,19 +762,60 @@ def pool_loop():
             elif proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"]:
                 now = time.time()
                 browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or now - last > POOL_REFRESH * 3
-                forced = POOL_EVT.is_set() or last == 0.0                    # dashboard se "Free auto" ya server start
-                if browser_free and (forced or (not POOL_IDLE and now - last > POOL_REFRESH)):
+                low = pool_good_n() < POOL_TOPUP
+                forced = POOL_EVT.is_set() or (last == 0.0 and low)          # dashboard se "Free auto" ya server start (pool kam ho tabhi)
+                if chrome_busy() and not POOL_EVT.is_set():
+                    browser_free = False                                     # Chrome khula hai: scan nahi
+                if browser_free and (forced or (not POOL_IDLE and low and now - last > POOL_REFRESH)):
                     POOL_EVT.clear()
                     pool_refresh()
                     last = time.time()
-                elif POOL_IDLE and not STATUS["running"] and now - last >= POOL_IDLE_EVERY:
+                elif (POOL_IDLE and not STATUS["running"] and not chrome_busy()
+                      and pool_good_n() < POOL_TOPUP and now - last >= POOL_IDLE_EVERY):
                     nxt = STATUS.get("next")
                     if nxt and nxt - now >= POOL_IDLE_MIN_WIN:               # agli visit tak khali time hai
                         pool_refresh(deadline=nxt - POOL_IDLE_MARGIN)
                         last = time.time()
+            pool_expire()
         except Exception as e:
             log("pool loop error:", type(e).__name__)
         POOL_EVT.wait(timeout=10 if (proxy_auto() and not pool_ready()) else 30)
+
+
+def chrome_busy():
+    """Visit chal rahi hai ya (idle-close mode me) Chrome khula hai -> scan/backup mat chalao."""
+    return bool(STATUS.get("visiting") or (BROWSER_CLOSE_IDLE and BROWSER is not None and pool_ready()))
+
+
+def pool_expire():
+    """POOL_KEEP_AGE (2 ghante) se purane proxy pool, recent list aur yaad-dasht se hata do."""
+    now = time.time()
+    cut = now - POOL_KEEP_AGE
+    gone = []
+    with POOL_LOCK:
+        keep = []
+        for g in POOL["good"]:
+            g.setdefault("t", now)
+            (keep if g["t"] >= cut else gone).append(g)
+        if gone:
+            POOL["good"] = keep
+            for g in gone:
+                POOL["cc"].pop(g["hp"], None)
+        for k in [k for k, v in POOL["bad"].items() if v <= now]:
+            del POOL["bad"][k]
+        ta = POOL_STATE["tested_at"]
+        for k in [k for k, v in ta.items() if v < now - POOL_RETEST_SEC]:
+            del ta[k]
+        d = _recent_load()
+        ch = False
+        for u in list(d):
+            n = [x for x in d[u] if x["t"] >= cut]
+            if len(n) != len(d[u]):
+                d[u], ch = n, True
+        if ch:
+            _recent_save()
+    if gone:
+        log(f"pool: {len(gone)} purane proxy (2 ghante+) delete, bache {pool_good_n()}")
 
 
 def pool_pick(url=None):
@@ -1923,6 +1973,20 @@ NOTE_T = {"gate": 0.0}
 
 
 def run_one(u):
+    """Visit ke dauran STATUS["visiting"]=True (scan/backup isi se ruk-te hain)."""
+    if not pool_ready():
+        return _run_one(u)
+    t = time.time()
+    while POOL["busy"] and time.time() - t < 45:       # chalta hua scan batch khatam hone do, phir Chrome kholo
+        time.sleep(1)
+    STATUS["visiting"] = True
+    try:
+        return _run_one(u)
+    finally:
+        STATUS["visiting"] = False
+
+
+def _run_one(u):
     """Ek app ko visit karo (browser crash par ek baar retry). Result dict ya None."""
     if not pool_ready():                                  # proxy tayyar nahi: server IP se visit nahi, baad me
         if time.time() - NOTE_T["gate"] > 600:
@@ -2431,7 +2495,7 @@ def _backup_collect():
             except OSError:
                 pass
     with POOL_LOCK:
-        good = [{"hp": g["hp"], "ms": g["ms"], "cc": POOL["cc"].get(g["hp"])} for g in POOL["good"][:100]]
+        good = [{"hp": g["hp"], "ms": g["ms"], "t": g.get("t"), "cc": POOL["cc"].get(g["hp"])} for g in POOL["good"][:100]]
     files["pool.json"] = json.dumps({"t": time.time(), "good": good}).encode()
     return files
 
@@ -2522,8 +2586,9 @@ def backup_restore():
         if rel == "pool.json":
             d = json.loads(raw.decode())
             if time.time() - float(d.get("t", 0)) < 3 * 3600:
-                good = [{"hp": g["hp"], "ms": int(g.get("ms", 3000)), "t": time.time()} for g in d.get("good", [])
-                        if isinstance(g, dict) and check_proxy(g.get("hp"))]
+                good = [{"hp": g["hp"], "ms": int(g.get("ms", 3000)), "t": float(g.get("t") or d.get("t", 0))} for g in d.get("good", [])
+                        if isinstance(g, dict) and check_proxy(g.get("hp"))
+                        and time.time() - float(g.get("t") or d.get("t", 0)) < POOL_KEEP_AGE]
                 with POOL_LOCK:
                     POOL["good"] = good
                     for g in d.get("good", []):
@@ -2568,6 +2633,9 @@ def backup_loop():
         return h.hexdigest()
     last_small, last_full = None, 0.0
     while BACKUP_URL:
+        if chrome_busy() or POOL["busy"]:   # Chrome/scan chal raha hai: baad me
+            time.sleep(20)
+            continue
         try:
             sm, now = small(), time.time()
             if sm != last_small or now - last_full >= BACKUP_EVERY:
