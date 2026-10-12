@@ -41,6 +41,9 @@ INPAGE_MAX = max(1, env_int("INPAGE_MAX", 6))         # ek visit me max itni
 INPAGE_PATHS = [x.strip() for x in os.environ.get("INPAGE_PATHS", "/").split(",") if x.strip().startswith("/")] or ["/"]
 RETRY_MIN, RETRY_MAX = 60, 180                        # wake fail ho to itne sec baad dobara
 LOG_DAYS = env_int("LOG_DAYS", 3)
+LOG_VIEW_HOURS = max(1, env_int("LOG_VIEW_HOURS", 8))     # dashboard par itne ghante ka log; poora log /log.txt (download) me
+LOG_VIEW_MAX = max(20, env_int("LOG_VIEW_MAX", 150))      # dashboard par max itni entry
+WAKE_ERR_MAX = max(1, env_int("WAKE_ERR_MAX", 2))         # proxy se itni baar lagatar network error to ye proxy chhod do (naya proxy lagega)
 COOKIE_DAYS = env_int("COOKIE_DAYS", 3)
 MEM_LIMIT = env_int("MEM_LIMIT_MB", 500)        # itni memory (MB) par browser restart hoga (visit ke baad)
 MEM_VISIT_LIMIT = env_int("MEM_VISIT_LIMIT_MB", MEM_LIMIT + 10)   # visit ke BEECH me itne par hi visit jaldi khatam (pehle 500 tha)
@@ -320,6 +323,7 @@ POOL_LOCK = threading.Lock()
 POOL_EVT = threading.Event()
 LAST_PX = {"hp": None}
 USED = deque(maxlen=POOL_AVOID)
+PICK_INFO = {"tried": 0}
 _IPPORT = re.compile(r"(?:(socks5|socks4|https?)://)?(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})(?!\d)", re.I)
 
 
@@ -348,12 +352,35 @@ def feed_url():
     return FEED_ENV
 
 
-def save_feed(url):
+def feed_every():
+    """Dashboard se set interval (sec) pehle, warna env (FEED_EVERY_SEC)."""
+    try:
+        with open(FEED_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("every"):
+            return max(120, int(d["every"]))
+    except (OSError, ValueError, TypeError):
+        pass
+    return FEED_EVERY
+
+
+def save_feed(url, every=None):
     os.makedirs(DATA, exist_ok=True)
+    data = {"url": url}
+    if every:
+        data["every"] = max(120, int(every))
+    else:
+        try:
+            with open(FEED_FILE) as f:
+                old = json.load(f)
+            if isinstance(old, dict) and old.get("every"):
+                data["every"] = old["every"]
+        except (OSError, ValueError):
+            pass
     tmp = FEED_FILE + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # key wali file sirf hamare liye
     with os.fdopen(fd, "w") as f:
-        json.dump({"url": url}, f)
+        json.dump(data, f)
     os.replace(tmp, FEED_FILE)
 
 
@@ -485,7 +512,7 @@ def pool_loop():
                     time.sleep(random.uniform(3, 6))
                     w += 4
                 ok = pool_feed_sync()
-                wait = FEED_EVERY * random.uniform(0.8, 1.2) if ok else min(300, 30 * (1 + POOL["fails"])) * random.uniform(0.8, 1.2)
+                wait = feed_every() * random.uniform(0.8, 1.2) if ok else min(300, 30 * (1 + POOL["fails"])) * random.uniform(0.8, 1.2)
         except Exception as e:
             log("pool loop error:", type(e).__name__)
             wait = 30
@@ -590,6 +617,7 @@ def pool_pick(url=None):
     """-> (proxy, reused). Har visit naya random proxy: pichle POOL_AVOID use hue aur bad-marked nahi.
     Chunne ke baad sirf TCP connect check (6 ek saath); dead ho to agla."""
     from concurrent.futures import ThreadPoolExecutor
+    PICK_INFO["tried"] = 0
     now = time.time()
     with POOL_LOCK:
         pool, bad = POOL["list"], POOL["bad"]
@@ -607,6 +635,7 @@ def pool_pick(url=None):
             cands += [h for h in sample if bad.get(h, 0) < now and h in used]
     for i in range(0, min(len(cands), POOL_PRECHECK_TRIES), 6):
         batch = cands[i:i + 6]
+        PICK_INFO["tried"] += len(batch)
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
             res = list(ex.map(lambda h: tcp_alive(h, POOL_PRECHECK_SEC), batch))
         with POOL_LOCK:
@@ -1358,14 +1387,13 @@ def human_dwell(page, url, obs, touch):
     reqs = []
     d0 = time.time()
     mem_chk = 0.0
-    STATUS["visit_peak"] = 0.0
     try:
         rwait(page, 1.5, 7.0)                          # page khulte hi koi kuch nahi karta, pehle dekhta hai
         while time.time() - d0 < target:
             if time.time() - mem_chk > 4:               # RAM sakht: limit paar hote hi visit samet lo, browser agli baar naya
                 mem_chk = time.time()
                 if mem_mb() > MEM_VISIT_LIMIT:
-                    RESTART["why"] = f"memory limit {MEM_VISIT_LIMIT} MB paar (visit ke beech)"
+                    RESTART["why"] = f"memory limit {MEM_VISIT_LIMIT} MB paar (visit ke beech), Python {STATUS.get('py_now', 0):.0f} + Chrome {STATUS.get('chrome_now', 0):.0f} MB"
                     log(f"RAM {STATUS['mem_now']:.0f} MB > {MEM_VISIT_LIMIT} MB, visit jaldi khatam")
                     break
             if req_at and time.time() - d0 >= req_at[0]:
@@ -1396,9 +1424,17 @@ def human_dwell(page, url, obs, touch):
 
 
 def visit(browser, url, direct=False):
+    STATUS["visit_peak"] = STATUS["visit_py"] = STATUS["visit_chrome"] = 0.0     # peak wake + reload + dwell, poori visit ka
+    _p0 = time.time()
     px, reused = pool_pick(url) if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else (None, False)
+    pick_ms = int((time.time() - _p0) * 1000)
+    geo_ms = 0
     if px:
+        _g0 = time.time()
         geo_lookup(px)                                  # proxy ka desh/timezone (fail ho to India default)
+        geo_ms = int((time.time() - _g0) * 1000)
+    base = mem_mb()                                     # visit shuru hone se pehle ki RAM (fresh browser ka asli base)
+    base_py = STATUS.get("py_now", 0)
     sp = state_path(url, px)                            # is proxy IP ki apni cookie file
     wake_max = (REUSE_WAKE_MAX if reused else POOL_WAKE_MAX) if px else WAKE_MAX   # purana chala hua proxy: zyada sabr
     fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
@@ -1519,11 +1555,17 @@ def visit(browser, url, direct=False):
         status, gate = load()                 # sirf ek baar kholo
         first = (status, gate)
         ok = awake(status, gate)
+        mem_mb()
+        err_streak = 1 if str(gate).startswith("err:") else 0
         seen, last_load = nav["n"], time.time()
         while not ok and time.time() - t0 < wake_max:
+            if px and err_streak >= WAKE_ERR_MAX:      # proxy se lagatar network error: ye proxy kharab, reload mat karo (naya proxy lagega)
+                log(f"proxy se {err_streak} baar network error, chhod diya: {px}")
+                break
             page.wait_for_timeout(2000)       # wake page par tab khula rehne do, bar-bar reload nahi
             if nav["n"] != seen:              # wake page ne khud app khola ya naya page laya
                 seen = nav["n"]
+                err_streak = 0
                 status, gate = nav["status"], nav["gate"]
                 ok = awake(status, gate)
                 continue
@@ -1533,6 +1575,8 @@ def visit(browser, url, direct=False):
                 status, gate = load()
                 seen, last_load = nav["n"], time.time()
                 ok = awake(status, gate)
+                err_streak = err_streak + 1 if str(gate).startswith("err:") else 0
+                mem_mb()
         if ok and HUMAN:
             dwell_done, inpage = human_dwell(page, url, obs, touch)
         elif ok:
@@ -1562,10 +1606,15 @@ def visit(browser, url, direct=False):
            "was_asleep": was_asleep, "dwell": dwell_done, "cookies": had_cookies, "reloads": reloads, "inpage": inpage,
            "via": (LAST_PX["hp"] or "seedha"), "phone": fp.get("model"),
            "cc": (pool_country(LAST_PX["hp"]) if LAST_PX["hp"] else None), "android": fp.get("android"),
-           "mem": int(STATUS.get("visit_peak") or 0)}
+           "mem": int(STATUS.get("visit_peak") or 0),
+           "py": int(STATUS.get("visit_py") or 0), "chrome": int(STATUS.get("visit_chrome") or 0),
+           "base": int(base), "base_py": int(base_py), "tz": fp.get("timezone_id"),
+           "geo_ms": geo_ms, "pick_ms": pick_ms, "tried": PICK_INFO["tried"], "pool": pool_good_n(),
+           "bage": int((time.time() - (STATUS["b_started"] or time.time())) / 60), "restarts": STATUS["restarts"]}
     log("visit", f"{url} status={status} gate={gate} took={res['took']}s {'AWAKE' if ok else 'STILL-ASLEEP'} "
                  f"was_asleep_before={'YES' if was_asleep else 'no'} cookies={'yes' if had_cookies else 'new'} reloads={reloads} js={'on' if JS_ON else 'OFF'} dwell={dwell_done}s inpage={inpage} "
-                 f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}]")
+                 f"fp=[{fp['platform']}/{fp['viewport']['width']}x{fp['viewport']['height']}/bat={fp['battery_level']}/cores={fp['hardware_concurrency']}] "
+                 f"ram={res['mem']}MB(py={res['py']}+chrome={res['chrome']}) base={res['base']}MB pick={pick_ms}ms/{PICK_INFO['tried']} geo={geo_ms}ms tz={fp['timezone_id']}")
     log_add(res)
     return res
 
@@ -1592,9 +1641,10 @@ def mem_mb():
             if pp in mine and pid not in mine:
                 mine.add(pid)
                 changed = True
-    tot = 0
+    tot, py_kb = 0, 0
     for pid in mine:
         got = False
+        before = tot
         try:
             with open(f"/proc/{pid}/smaps_rollup") as f:
                 for line in f:
@@ -1610,10 +1660,14 @@ def mem_mb():
                     tot += int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
             except (OSError, ValueError, IndexError):
                 pass
+        if pid == me:
+            py_kb = tot - before
     mb = tot / 1024
-    STATUS["mem_now"] = mb
+    py = py_kb / 1024
+    STATUS["mem_now"], STATUS["py_now"], STATUS["chrome_now"] = mb, py, max(0.0, mb - py)
     if mb > STATUS.get("visit_peak", 0):
         STATUS["visit_peak"] = mb
+        STATUS["visit_py"], STATUS["visit_chrome"] = py, max(0.0, mb - py)
     if mb > STATUS["mem_peak"]:
         STATUS["mem_peak"] = mb
     return mb
@@ -1771,7 +1825,7 @@ def check_health():
     mb = mem_mb()
     age_h = (time.time() - (STATUS["b_started"] or time.time())) / 3600
     if mb > MEM_LIMIT:
-        launch_browser(f"memory {mb:.0f} MB > limit {MEM_LIMIT} MB")
+        launch_browser(f"memory {mb:.0f} MB > limit {MEM_LIMIT} MB, Python {STATUS.get('py_now', 0):.0f} + Chrome {STATUS.get('chrome_now', 0):.0f} MB")
     elif age_h > MAX_HOURS:
         launch_browser(f"{age_h:.0f} ghante purana")
 
@@ -1946,38 +2000,73 @@ def self_ping():
 
 # ---------------------------------------------------------------- dashboard
 CSS = """
-:root{--bg:#f6f7f9;--card:#fff;--tx:#0f172a;--mu:#64748b;--ln:#e6e9ef;--ac:#4f46e5;--acbg:#eef2ff;--ok:#059669;--okbg:#ecfdf5;--bad:#dc2626;--badbg:#fef2f2;--warn:#b45309;--warnbg:#fffbeb}
-*{box-sizing:border-box}html{color-scheme:light}
-body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
-.wrap{max-width:720px;margin:0 auto;padding:18px 14px 40px}
-.top{display:flex;justify-content:space-between;align-items:center;margin:2px 2px 16px}
+:root{color-scheme:light dark;--bg:#f2f4f8;--panel:#fff;--ink:#141821;--mute:#667085;--line:#e3e7ef;--soft:#f5f7fb;--acc:#3a56d4;--on-acc:#fff;--ok:#0f7a56;--ok-bg:#e2f4ec;--warn:#9a5b00;--warn-bg:#fcefd6;--bad:#c42b3e;--bad-bg:#fde7ea;--py:#8b5cf6;--ch:#2f80ed}
+@media(prefers-color-scheme:dark){:root{--bg:#0b0e13;--panel:#131821;--ink:#e8ecf3;--mute:#8b95a7;--line:#222a36;--soft:#171d27;--acc:#8aa0ff;--on-acc:#0b0e13;--ok:#3fd0a0;--ok-bg:#10302a;--warn:#f2b552;--warn-bg:#352a11;--bad:#ff7d8c;--bad-bg:#3b1a21;--py:#b49cff;--ch:#6eacff}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:max(16px,env(safe-area-inset-top)) 14px max(40px,env(safe-area-inset-bottom))}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:4px 2px 14px}
 h1{font-size:22px;font-weight:700;letter-spacing:-.02em;margin:0}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:99px;font-size:12px;font-weight:600;background:var(--okbg);color:var(--ok)}
+h2{font-size:15px;font-weight:650;margin:0}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:99px;font-size:12.5px;font-weight:600;background:var(--ok-bg);color:var(--ok)}
 .pill:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
-.pill.y{background:var(--warnbg);color:var(--warn)}.pill.r{background:var(--badbg);color:var(--bad)}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.stat{background:var(--card);border:1px solid var(--ln);border-radius:16px;padding:14px}
-.stat .k{color:var(--mu);font-size:12px;font-weight:500}
-.stat .v{font-size:23px;font-weight:700;letter-spacing:-.02em;margin-top:1px}
-.stat .s{color:var(--mu);font-size:12px}
-.bar{height:6px;background:var(--ln);border-radius:9px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:var(--ok);border-radius:9px}.bar.hi i{background:#d97706}
-.card{background:var(--card);border:1px solid var(--ln);border-radius:18px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(15,23,42,.04)}
-h2{font-size:14px;font-weight:650;margin:0 0 12px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.mu{color:var(--mu);font-size:12px;line-height:1.55}.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
-.chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600;background:#f1f3f7;color:#475569;margin:2px 4px 2px 0}
-.chip.g{background:var(--okbg);color:var(--ok)}.chip.r{background:var(--badbg);color:var(--bad)}.chip.y{background:var(--warnbg);color:var(--warn)}
-.row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--ln)}.row:last-of-type{border:0}
-.row .rt{flex:1;min-width:0}.row b{display:block;font-weight:600;word-break:break-all}
-.dot{width:9px;height:9px;border-radius:50%;background:#cbd5e1;flex:none}.dot.g{background:#10b981}.dot.r{background:#ef4444}
-input[type=text],input[type=password]{display:block;width:100%;padding:12px 13px;margin:8px 0 0;border:1px solid var(--ln);border-radius:12px;font-size:15px;background:#fbfcfd;color:var(--tx);outline:none}
-input:focus{border-color:var(--ac);background:#fff;box-shadow:0 0 0 3px var(--acbg)}
-.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.btns button{flex:1 1 130px}
-button{padding:11px 15px;border:0;border-radius:12px;background:var(--ac);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
-button.soft{background:var(--acbg);color:var(--ac)}button.ghost{background:#f1f3f7;color:#475569}button.red{background:var(--badbg);color:var(--bad)}
-button.sm{padding:7px 12px;flex:none;font-size:13px}button:disabled{opacity:.5}
-form{margin:0}details{margin-top:14px;border-top:1px solid var(--ln);padding-top:12px}summary{cursor:pointer;color:var(--mu);font-size:13px;font-weight:600}
-.lg{padding:10px 0;border-bottom:1px solid var(--ln);font-size:13px;line-height:1.5}.lg:last-child{border:0}.lg .t{color:var(--mu);font-size:11px}
-.ev{color:var(--mu)}a{color:var(--ac);text-decoration:none;font-weight:600;font-size:12px}code{background:#f1f3f7;padding:2px 6px;border-radius:6px;font-size:12px;word-break:break-all}
+.pill.y{background:var(--warn-bg);color:var(--warn)}.pill.r{background:var(--bad-bg);color:var(--bad)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;margin:12px 0;overflow:hidden}
+.ph{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:15px 16px 11px}
+.pb{padding:4px 16px 16px}
+.sub{color:var(--mute);font-size:12.5px}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}.warn{color:var(--warn);font-weight:600}
+.meta{display:flex;flex-wrap:wrap;gap:2px 12px;color:var(--mute);font-size:12.5px}
+.dot{width:9px;height:9px;border-radius:50%;background:#b3bac8;flex:none}.dot.g{background:var(--ok)}.dot.r{background:var(--bad)}
+.app{display:grid;grid-template-columns:9px 1fr auto;gap:12px;align-items:center;padding:12px 16px;border-top:1px solid var(--line)}
+.app b,.lg b{word-break:break-all;font-weight:600}
+.ram{padding:4px 16px 14px}
+.ramtop{display:flex;align-items:baseline;gap:6px;margin-bottom:8px}
+.ramnum{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.bar{position:relative;height:10px;border-radius:6px;background:var(--soft);border:1px solid var(--line);overflow:hidden}
+.bar i{display:block;float:left;height:100%}.bar .py{background:var(--py)}.bar .ch{background:var(--ch)}
+.bar .lim{position:absolute;top:0;bottom:0;width:2px;background:var(--ink);transform:translateX(-2px)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:9px;color:var(--mute);font-size:12.5px}
+.sw{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px}.sw.py{background:var(--py)}.sw.ch{background:var(--ch)}
+.cells{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line)}
+.cell{padding:12px 16px}.cell+.cell{border-left:1px solid var(--line)}
+.cell .k{color:var(--mute);font-size:12.5px}.cell .v{font-size:19px;font-weight:700;letter-spacing:-.01em;margin-top:1px}
+.log details.lg,.log .evr{border-top:1px solid var(--line)}
+.lg summary{display:grid;grid-template-columns:9px 1fr auto 8px;gap:12px;align-items:center;padding:11px 16px;cursor:pointer;list-style:none}
+.lg summary::-webkit-details-marker{display:none}
+.lg summary::after{content:"";width:7px;height:7px;border-right:2px solid var(--mute);border-bottom:2px solid var(--mute);transform:rotate(45deg);margin-top:-3px}
+.lg[open] summary::after{transform:rotate(-135deg);margin-top:3px}
+.lg .end{display:flex;flex-direction:column;align-items:flex-end;gap:1px;text-align:right}
+.lg .end .sub{display:flex;gap:10px}
+.lg[open] summary{background:var(--soft)}
+.kv{margin:0;padding:6px 16px 12px;background:var(--soft)}
+.kv div{display:flex;justify-content:space-between;gap:16px;padding:5px 0;border-top:1px dashed var(--line)}.kv div:first-child{border-top:0}
+.kv dt{color:var(--mute);flex:none}.kv dd{margin:0;text-align:right;word-break:break-all}
+.evr{display:grid;grid-template-columns:44px 1fr;gap:10px;padding:9px 16px;color:var(--mute);font-size:13px}
+.evr.bad{color:var(--bad);font-weight:400}
+.chip{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--soft);color:var(--mute);border:1px solid var(--line)}
+.chip.g{background:var(--ok-bg);color:var(--ok);border-color:transparent}.chip.r{background:var(--bad-bg);color:var(--bad);border-color:transparent}.chip.y{background:var(--warn-bg);color:var(--warn);border-color:transparent}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--soft);border:1px solid var(--line);padding:2px 6px;border-radius:6px;word-break:break-all}
+input[type=text],input[type=password]{display:block;width:100%;min-height:44px;padding:0 13px;margin:10px 0 0;border:1px solid var(--line);border-radius:11px;font-size:16px;font-family:inherit;background:var(--soft);color:var(--ink);outline:none}
+input:focus-visible{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 25%,transparent)}
+button{min-height:42px;padding:0 16px;border:0;border-radius:11px;background:var(--acc);color:var(--on-acc);font-size:14px;font-weight:600;font-family:inherit;cursor:pointer}
+button.soft{background:var(--soft);color:var(--ink);border:1px solid var(--line)}
+button.red{background:var(--bad-bg);color:var(--bad)}
+button.sm{min-height:34px;padding:0 12px;font-size:13px}
+button:disabled{opacity:.5}
+button:focus-visible,summary:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.btns>*{flex:1 1 130px}
+form{margin:0}
+details.more{margin-top:12px;border-top:1px solid var(--line);padding-top:10px}
+details.more summary{cursor:pointer;color:var(--mute);font-weight:600}
+a{color:var(--acc);text-decoration:none;font-weight:600;font-size:13px}
+.note{margin:0 0 10px}
+"""
+
+JS = """
+document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',()=>{setTimeout(()=>Array.from(f.elements).forEach(el=>{if(el.tagName==='BUTTON')el.disabled=true}),0)}));
+setInterval(()=>{const a=document.activeElement;if((a&&a.tagName==='INPUT')||document.querySelector('details[open]'))return;location.reload()},12000);
 """
 
 
@@ -1987,6 +2076,82 @@ def _chip(txt, cls=""):
 
 def esc(s):
     return html.escape(str(s), quote=True)
+
+
+def ago(t):
+    s = max(0, int(time.time() - t))
+    if s < 60:
+        return "abhi"
+    if s < 3600:
+        return f"{s // 60} min pehle"
+    if s < 86400:
+        return f"{s // 3600} ghante pehle"
+    return f"{s // 86400} din pehle"
+
+
+def dur(s):
+    s = max(0, int(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+
+def _host(u):
+    return u.replace("https://", "").replace("http://", "").strip("/")
+
+
+def _kv(k, v):
+    return f"<div><dt>{k}</dt><dd>{v}</dd></div>"
+
+
+def _log_row(e):
+    hhmm = fmt_t(e["t"])[-8:]
+    if "event" in e:
+        cls = " bad" if e["event"] == "error" else ""
+        return (f'<div class="evr{cls}"><span>{hhmm[:5]}</span>'
+                f'<span>{esc(e.get("msg", e["event"]))}</span></div>')
+    ok = bool(e.get("ok"))
+    via = e.get("via")
+    direct = via in (None, "seedha")
+    shown = "" if direct else mask_proxy(via)
+    scheme, hp = (shown.split("://", 1) if "://" in shown else ("", shown))
+    st = esc(e["status"]) if e.get("status") is not None else ""
+    if e.get("gate"):
+        st = (st + " " + esc(e["gate"])).strip()
+    st = st or "-"
+    asleep = "so raha tha" if e.get("was_asleep") else "jaaga tha"
+    end = f'<span>{e.get("took", 0)}s</span>'
+    if e.get("mem"):
+        end += f'<span>{e["mem"]} MB</span>'
+    rows = [_kv("Proxy", "server IP" if direct else esc((scheme + " " + hp).strip()))]
+    geo = " ".join(str(x) for x in (e.get("cc"), e.get("tz")) if x)
+    if geo:
+        rows.append(_kv("Desh / timezone", esc(geo)))
+    if e.get("phone"):
+        rows.append(_kv("Phone", esc(e["phone"]) + (" (Android " + esc(e["android"]) + ")" if e.get("android") else "")))
+    rows.append(_kv("Cookies", "purani" if e.get("cookies") else "nayi"))
+    rows.append(_kv("Reloads", esc(e.get("reloads", 0))))
+    if e.get("dwell"):
+        rows.append(_kv("Page par", f'{e["dwell"]}s'))
+    if e.get("inpage"):
+        rows.append(_kv("Page ke andar", esc(" ".join(str(x) for x in e["inpage"][:8]))))
+    if e.get("mem"):
+        split = f' (Python {e["py"]} + Chrome {e["chrome"]})' if "py" in e else ""
+        rows.append(_kv("RAM peak", f'{e["mem"]} MB{split}'))
+    if e.get("base"):
+        rows.append(_kv("RAM shuru me", f'{e["base"]} MB (Python {e.get("base_py", 0)})'))
+    if "pick_ms" in e:
+        rows.append(_kv("Proxy chunna", f'{e["pick_ms"]} ms, {e.get("tried", 0)} check, geo {e.get("geo_ms", 0)} ms, pool {e.get("pool", 0)}'))
+    if "bage" in e:
+        rows.append(_kv("Browser", f'{e["bage"]} min purana, restarts {e.get("restarts", 0)}'))
+    dot = "g" if ok else "r"
+    cls = "ok" if ok else "bad"
+    return (f'<details class="lg"><summary><span class="dot {dot}"></span>'
+            f'<span><b>{esc(_host(e["url"]))}</b><span class="meta"><span>{hhmm}</span><span>{asleep}</span></span></span>'
+            f'<span class="end"><b class="{cls}">{st}</b><span class="sub">{end}</span></span></summary>'
+            f'<dl class="kv">{"".join(rows)}</dl></details>')
 
 
 def dashboard():
@@ -2003,103 +2168,100 @@ def dashboard():
         slept = sum(1 for e in d24 if e.get("was_asleep"))
         if last and last.get("ok"):
             awake_n += 1
-            dot, st = "g", '<span class="ok">AWAKE</span>'
+            dot, st = "g", '<span class="ok">Jaag raha hai</span>'
         elif last:
-            dot, st = "r", '<span class="bad">ASLEEP</span>'
+            dot, st = "r", '<span class="bad">So raha hai</span>'
         else:
-            dot, st = "", "abhi visit nahi"
-        when = fmt_t(last["t"]) if last else "-"
+            dot, st = "", "<span>Abhi visit nahi hui</span>"
+        extra = (f'<span>aakhri visit {ago(last["t"])}</span><span>24h me so raha tha {slept}/{len(d24)}</span>'
+                 if last else "")
         app_rows.append(
-            f'<div class="row"><span class="dot {dot}"></span><div class="rt"><b>{esc(u.replace("https://", "").replace("http://", "").strip("/"))}</b>'
-            f'<span class="mu">{st} &middot; aakhri {when} &middot; 24h me so raha tha {slept}/{len(d24)}</span></div>'
+            f'<div class="app"><span class="dot {dot}"></span><div><b>{esc(_host(u))}</b>'
+            f'<div class="meta">{st}{extra}</div></div>'
             f'<form method="post" action="/del" onsubmit="return confirm(\'Hata dun?\')">'
-            f'<input type="hidden" name="url" value="{esc(u)}"><button class="red sm">Hatao</button></form></div>')
-    # ---- log
-    logs = []
-    for e in reversed(entries[-60:]):
-        if "event" in e:
-            if e["event"] == "round":
-                continue
-            logs.append(f'<div class="lg ev"><span class="t">{fmt_t(e["t"])}</span> &middot; {esc(e.get("msg", e["event"]))}</div>')
-            continue
-        okc = "ok" if e.get("ok") else "bad"
-        via = e.get("via")
-        via_s = "server IP" if via in (None, "seedha") else esc(mask_proxy(via).replace("http://", "").replace("https://", ""))
-        logs.append(
-            f'<div class="lg"><span class="t">{fmt_t(e["t"])}</span><br>'
-            f'<b>{esc(e["url"].replace("https://", "").replace("http://", "").strip("/"))}</b> '
-            f'<span class="{okc}">{esc(e.get("status"))}{" " + esc(e["gate"]) if e.get("gate") else ""}</span> &middot; '
-            f'{"so raha tha" if e.get("was_asleep") else "jaaga tha"} &middot; {e.get("took")}s<br>'
-            f'<span class="mu">{via_s}{" [" + esc(e["cc"]) + "]" if e.get("cc") else ""} &middot; '
-            f'{esc(e.get("phone") or "-")}{" A" + esc(e["android"]) if e.get("android") else ""} &middot; '
-            f'{"cookies" if e.get("cookies") else "nayi"}'
-            f'{" &middot; RAM " + str(e["mem"]) + " MB" if e.get("mem") else ""}</span></div>')
+            f'<input type="hidden" name="url" value="{esc(u)}"><button class="soft sm">Hatao</button></form></div>')
+    # ---- log (sirf pichle LOG_VIEW_HOURS ghante; poora log /log.txt download me)
+    cut = now - LOG_VIEW_HOURS * 3600
+    recent = [e for e in reversed(entries) if e.get("t", 0) >= cut and e.get("event") != "round"]
+    shown = recent[:LOG_VIEW_MAX]
+    log_html = "".join(_log_row(e) for e in shown)
+    cut_note = (f'<div class="pb sub">Latest {LOG_VIEW_MAX} dikh rahe hain, baaki download me.</div>'
+                if len(recent) > LOG_VIEW_MAX else "")
     # ---- status
     nxt = STATUS.get("next")
-    nxt_s = "chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec" if nxt else "-")
+    nxt_s = "chal raha" if STATUS["running"] else (dur(nxt - now) if nxt else "-")
     up = int(now - STATUS["started"])
     mem, lim = STATUS.get("mem_now", 0) or 0, MEM_LIMIT
-    pct = max(0, min(100, int(mem * 100 / lim))) if lim else 0
+    py, chm = STATUS.get("py_now", 0) or 0, STATUS.get("chrome_now", 0) or 0
+    if not (py or chm):
+        chm = mem
+    den = max(lim, mem, 1)
+    w_py, w_ch, lim_x = py / den * 100, chm / den * 100, lim / den * 100
+    mem_cls = "warn" if mem > lim else ""
     # ---- proxy
     cur, auto, f_url = get_proxy_url(), proxy_auto(), feed_url()
     with POOL_LOCK:
         pnote, found = POOL["note"], POOL["found"]
-        pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
     pg = pool_good_n()
     ready = pool_ready()
     if auto:
         src = f'<code>{esc(mask_feed(f_url))}</code>' if f_url else _chip("URL set nahi hai", "r")
-        top = ('<span class="pill">Chal raha hai</span>' if ready
-               else '<span class="pill y">Proxy list ka intezaar</span>')
+        top = '<span class="pill">Chal raha hai</span>' if ready else '<span class="pill y">Proxy list ka intezaar</span>'
+        pchip = _chip("API list", "g" if ready else "y")
     elif cur:
-        src, top = f'<code>{esc(mask_proxy(cur))}</code>', '<span class="pill">Manual proxy</span>'
+        src, top, pchip = f'<code>{esc(mask_proxy(cur))}</code>', '<span class="pill">Manual proxy</span>', _chip("Manual", "g")
     else:
-        src, top = "", '<span class="pill r">Proxy band (server IP)</span>'
+        src, top, pchip = "", '<span class="pill r">Proxy band (server IP)</span>', _chip("Band", "r")
     if BACKUP_URL:
-        ok_t = fmt_t(BACKUP["last_ok"]) if BACKUP["last_ok"] else "abhi tak nahi"
-        backup_html = (f'<div>{_chip("ON", "g") if not BACKUP["err"] else _chip("ERROR: " + esc(BACKUP["err"]), "r")}'
-                       f'<span class="mu">aakhri save {ok_t} &middot; {BACKUP["size"] // 1024} KB'
-                       f'{" &middot; restore: " + esc(BACKUP["restored"]) if BACKUP["restored"] else ""}</span></div>'
+        ok_t = ago(BACKUP["last_ok"]) if BACKUP["last_ok"] else "abhi tak nahi"
+        state = _chip("ON", "g") if not BACKUP["err"] else _chip("Error: " + esc(BACKUP["err"]), "r")
+        restored = f', restore: {esc(BACKUP["restored"])}' if BACKUP["restored"] else ""
+        backup_html = (f'<div>{state} <span class="sub">aakhri save {ok_t}, {BACKUP["size"] // 1024} KB{restored}</span></div>'
                        '<form method="post" action="/backup"><div class="btns"><button name="act" value="save" class="soft">Abhi backup lo</button>'
-                       '<button name="act" value="restore" class="ghost" onclick="return confirm(\'Backup se wapas laun? Abhi ka data badal jayega.\')">Restore karo</button></div></form>')
+                       '<button name="act" value="restore" class="soft" onclick="return confirm(\'Backup se wapas laun? Abhi ka data badal jayega.\')">Restore karo</button></div></form>')
     else:
-        backup_html = f'{_chip("OFF", "r")}<span class="mu">Render env me <code>BACKUP_URL</code> daalo.</span>'
-    mode_line = (f"30 min me {VISITS_MIN}-{VISITS_MAX} visit &middot; page par {DWELL_MIN}-{DWELL_MAX}s"
-                 if HUMAN else f"har {EVERY//60} min &middot; page par {DWELL}s")
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        backup_html = f'<div>{_chip("OFF", "r")} <span class="sub">Render env me <code>BACKUP_URL</code> daalo.</span></div>'
+    return f"""<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Keepalive</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><h1>Keepalive</h1>{top}</div>
-<div class="grid">
-  <div class="stat"><div class="k">Apps</div><div class="v">{len(apps)}</div><div class="s">{awake_n} jaag rahe</div></div>
-  <div class="stat"><div class="k">Proxy ready</div><div class="v">{pg}</div><div class="s">list me {found} &middot; {pu}</div></div>
-  <div class="stat"><div class="k">RAM</div><div class="v">{mem:.0f}<span class="s"> / {lim} MB</span></div><div class="bar{' hi' if pct > 85 else ''}"><i style="width:{pct}%"></i></div></div>
-  <div class="stat"><div class="k">Agli visit</div><div class="v" style="font-size:19px;padding-top:3px">{nxt_s}</div><div class="s">uptime {up//3600}h {up%3600//60}m</div></div>
-</div>
-<div class="card"><h2>Apps</h2>{''.join(app_rows) or '<div class="mu">Koi app nahi. Neeche se jodo.</div>'}
-<form method="post" action="/add" style="margin-top:6px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
-<div class="btns"><button>Add karo</button><button class="ghost" formaction="/run">Abhi visit karo</button></div></form>
-<div class="mu" style="margin-top:8px">{mode_line}</div></div>
-<div class="card"><h2>Proxy list (API)</h2>
-<div>{src}</div>
-<form method="post" action="/feed" autocomplete="off">
-  <input type="text" name="feed_url" placeholder="https://.../api/proxies?key=..." autocomplete="off">
-  <div class="btns"><button name="act" value="save">Save + list lo</button><button name="act" value="refresh" class="soft">Abhi list lo</button></div>
-</form>
-<div class="mu" style="margin-top:10px">{esc(pnote)}. List har ~5 min me khud aati hai (max {FEED_MAX}), Render koi proxy test nahi karta, har visit par naya random proxy. Box khali + &ldquo;Abhi list lo&rdquo; = isi URL se turant.</div>
-<details><summary>Manual proxy / Band</summary>
+
+<section class="panel"><div class="ph"><h2>Apps</h2><span class="sub">{awake_n} / {len(apps)} jaag rahe</span></div>
+{''.join(app_rows) or '<div class="pb sub">Koi app nahi. Neeche link daalo.</div>'}
+<form class="pb" method="post" action="/add" style="border-top:1px solid var(--line);margin-top:0;padding-top:6px">
+<input type="text" name="url" placeholder="https://myapp.blitz.cloud" required autocapitalize="off" autocorrect="off" spellcheck="false">
+<div class="btns"><button>Add karo</button><button class="soft" formaction="/run">Abhi visit karo</button></div></form></section>
+
+<section class="panel"><div class="ph"><h2>Server</h2><span class="sub">{dur(up)} se chalu</span></div>
+<div class="ram"><div class="ramtop"><span class="ramnum {mem_cls}">{mem:.0f}</span><span class="sub">/ {lim} MB RAM</span></div>
+<div class="bar"><i class="py" style="width:{w_py:.1f}%"></i><i class="ch" style="width:{w_ch:.1f}%"></i><b class="lim" style="left:{lim_x:.1f}%"></b></div>
+<div class="legend"><span><i class="sw py"></i>Python {py:.0f}</span><span><i class="sw ch"></i>Chrome {chm:.0f}</span><span>peak {STATUS['mem_peak']:.0f}</span></div></div>
+<div class="cells">
+<div class="cell"><div class="k">Proxy ready</div><div class="v">{pg}</div><div class="sub">list me {found}</div></div>
+<div class="cell"><div class="k">Agli visit</div><div class="v">{nxt_s}</div></div>
+<div class="cell"><div class="k">Restarts</div><div class="v">{STATUS['restarts']}</div><div class="sub">{esc(STATUS['engine'])}</div></div>
+</div></section>
+
+<section class="panel log"><div class="ph"><h2>Log</h2><a href="/log.txt" download>Poora log download</a></div>
+<div class="pb sub" style="padding-top:0;padding-bottom:10px">Pichhle {LOG_VIEW_HOURS} ghante, {len(shown)} entry.</div>
+{log_html or '<div class="pb sub" style="border-top:1px solid var(--line);padding-top:12px">Is dauran koi log nahi.</div>'}{cut_note}</section>
+
+<section class="panel"><div class="ph"><h2>Proxy</h2>{pchip}</div>
+<div class="pb"><p class="note sub">{esc(pnote)}</p>{src}
+<p class="sub">Har {feed_every()}s me list dobara aati hai.</p>
+<div class="btns"><button name="act" value="refresh" form="feedform">Abhi list lo</button></div>
+<details class="more"><summary>URL ya manual proxy badlo</summary>
+<form id="feedform" method="post" action="/feed" autocomplete="off">
+<input type="text" name="feed_url" placeholder="https://.../api/proxies?key=..." autocomplete="off" autocapitalize="off" spellcheck="false">
+<input type="text" name="feed_every" placeholder="Refresh interval sec (min 120, default 300)" autocomplete="off" inputmode="numeric">
+<div class="btns"><button name="act" value="save">Save + list lo</button><button name="act" value="interval" class="soft">Sirf interval save</button></div></form>
 <form method="post" action="/proxy" autocomplete="off">
-  <input type="text" name="proxy_url" placeholder="http://user:pass@host:port" autocomplete="off">
-  <div class="btns"><button name="act" value="save" class="soft">Manual save</button><button name="act" value="auto" class="ghost">API list wapas</button><button name="act" value="off" class="red">Band</button></div>
-</form></details></div>
-<div class="card"><h2>Backup</h2>{backup_html}
-<div class="mu" style="margin-top:8px">Apps, proxy list ka URL, proxy settings, log aur cookies backup me jaate hain; disk reset ke baad apne-aap wapas aate hain aur list turant API se aa jati hai.</div></div>
-<div class="card"><h2>Log <a href="/log.txt">download</a></h2>{''.join(logs) or '<div class="mu">Abhi log khali hai.</div>'}</div>
-<div class="mu" style="text-align:center">Server {up//3600}h {up%3600//60}m se chalu &middot; peak RAM {STATUS['mem_peak']:.0f} MB &middot; browser {esc(STATUS['engine'])}, restarts {STATUS['restarts']}</div>
+<input type="text" name="proxy_url" placeholder="http://user:pass@host:port" autocomplete="off" autocapitalize="off" spellcheck="false">
+<div class="btns"><button name="act" value="save" class="soft">Manual save</button><button name="act" value="auto" class="soft">API list wapas</button><button name="act" value="off" class="red">Band</button></div></form>
+</details></div></section>
+
+<section class="panel"><div class="ph"><h2>Backup</h2></div><div class="pb">{backup_html}</div></section>
 </div>
-<script>
-document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',()=>{{setTimeout(()=>f.querySelectorAll('button').forEach(b=>b.disabled=true),0)}}));
-setInterval(()=>{{const a=document.activeElement;if(!a||a.tagName!=='INPUT')location.reload()}},12000);
-</script></body></html>"""
+<script>{JS}</script></body></html>"""
 
 
 class H(BaseHTTPRequestHandler):
@@ -2152,7 +2314,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, dashboard())
         if path == "/log.txt":
             lines = [json.dumps({**e, "time": fmt_t(e["t"])}) for e in log_read(time.time() - LOG_DAYS * 86400)]
-            return self._send(200, "\n".join(lines) + "\n", "text/plain; charset=utf-8")
+            return self._send(200, "\n".join(lines) + "\n", "text/plain; charset=utf-8",
+                              {"Content-Disposition": 'attachment; filename="keepalive-log.txt"'})
         self._send(404, "nahi mila", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -2182,10 +2345,19 @@ class H(BaseHTTPRequestHandler):
         if path == "/feed":
             act = (form.get("act") or [""])[0]
             raw = (form.get("feed_url") or [""])[0].strip()
+            every_raw = (form.get("feed_every") or [""])[0].strip()
             if act == "refresh" and not raw:
                 if not feed_url():
                     return self._send(400, "Pehle proxy list ka URL save karo.", "text/plain; charset=utf-8")
                 POOL_EVT.set()
+                return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
+            if act == "interval":
+                if not feed_url():
+                    return self._send(400, "Pehle proxy list ka URL save karo.", "text/plain; charset=utf-8")
+                if not every_raw.isdigit() or int(every_raw) < 120:
+                    return self._send(400, "Interval kam se kam 120 sec hona chahiye.", "text/plain; charset=utf-8")
+                save_feed(feed_url(), every=int(every_raw))
+                log_event(f"proxy refresh interval save: {every_raw}s")
                 return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
             url = norm_feed_url(raw) if raw else None
             if not url:
@@ -2200,7 +2372,7 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(400, f"List nahi mili ({type(e).__name__}). URL check karo. Save nahi hua.", "text/plain; charset=utf-8")
             try:
-                save_feed(url)
+                save_feed(url, every=int(every_raw) if every_raw.isdigit() and int(every_raw) >= 120 else None)
                 if not proxy_auto():
                     save_proxy_url(PROXY_AUTO)
                     RESTART["why"] = "API list mode on"
