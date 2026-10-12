@@ -4,6 +4,7 @@
 Dashboard: "/" (password), apps add/delete, 3-din ka log. "/ping" public (uptime bot ke liye).
 Cookies har app ke liye disk par save hoti hain aur purani apne-aap delete.
 """
+from collections import deque
 import gzip, os, re, sys, time, json, random, threading, urllib.request, html, hmac, base64, hashlib, secrets, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -47,7 +48,7 @@ MAX_HOURS = env_int("BROWSER_MAX_HOURS", 12)    # itne ghante baad browser resta
 MAX_LOG_LINES = 20000
 MAX_STATE_BYTES = 300 * 1024
 COOKIE_MAX_PER_APP = max(1, env_int("COOKIE_MAX_PER_APP", 60))   # ek app ki itni proxy-wali cookie files tak
-MAX_APPS = 50
+MAX_APPS = env_int("MAX_APPS", 100)
 TZ_MIN = env_int("TZ_OFFSET_MIN", 330)        # IST
 SUFFIXES = [s.strip().lower() for s in os.environ.get("ALLOWED_SUFFIXES", "blitz.cloud").split(",") if s.strip()]
 DATA = os.environ.get("DATA_DIR", "/tmp/keepalive-data")
@@ -242,10 +243,10 @@ def check_proxy(url):
         port = u.port
     except ValueError:
         return None
-    if u.scheme not in ("http", "https", "socks5") or not u.hostname or not port:
+    if u.scheme not in ("http", "https", "socks5", "socks4") or not u.hostname or not port:
         return None
-    if u.scheme == "socks5" and (u.username or u.password):
-        return None   # Chromium socks5 par login support nahi karta
+    if u.scheme in ("socks5", "socks4") and (u.username or u.password):
+        return None   # Chromium socks par login support nahi karta
     return url
 
 
@@ -290,125 +291,35 @@ def proxy_cfg():
     return cfg
 
 
-# ---------------------------------------------------------------- free proxy pool (GitHub lists)
-# Har POOL_REFRESH_MIN (default 30) min me list laao, POOL_TEST_COUNT (default 150) random proxy test karo,
-# sabse tez POOL_KEEP bachao. Har visit inme se random (tez wale zyada) chunta hai.
-# Sirf Chromium engine me chalta hai (Obscura me proxy launch par fix hoti hai).
-POOL_AUTO_ENV = env_int("FREE_PROXY_AUTO", 1) != 0   # disk reset ke baad bhi Free auto se hi shuru (server IP se nahi)
-POOL_SOURCES = [x.strip() for x in os.environ.get("POOL_SOURCES", ",".join([
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/https.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks4.txt",
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt",
-])).split(",") if x.strip()]
-# iplocate/free-proxy-list: countries/<CC>/proxies.txt (GitHub par dekh kar confirm kiya)
-POOL_COUNTRIES = [c.strip().upper() for c in os.environ.get("POOL_COUNTRIES", "IN,US,DE,GB,SG,NL,FR,BR,ID").split(",") if c.strip()]
-IPLOC = "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/countries/"
-POOL_REFRESH = max(5, env_int("POOL_REFRESH_MIN", 60)) * 60
-POOL_TEST_N = max(10, env_int("POOL_TEST_COUNT", 60))
-POOL_KEEP = max(1, env_int("POOL_KEEP", 40))
-POOL_MAX_MS = max(1000, env_int("POOL_MAX_MS", 8000))      # isse dheere proxy reject
-POOL_WORKERS = max(1, min(40, env_int("POOL_WORKERS", 35)))     # ek saath itne test (40 se upar nahi)
-POOL_BATCH = max(10, env_int("POOL_BATCH", 60))                  # itne proxy ek saath, phir RAM check
-BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0      # visit ke baad Chromium band (RAM khali), agli visit par phir khulega
+# ---------------------------------------------------------------- proxy list (API se)
+# Proxy ki list ek API URL se aati hai: har ~5 min me badalti hai, max 5000 line, har line
+# socks5://ip:port | socks4://ip:port | http://ip:port. Render koi proxy TEST nahi karta:
+# list download (1-5 sec, 1-5 MB se kam RAM) -> seedha pool me. Har visit par naya random proxy.
+POOL_AUTO_ENV = env_int("FREE_PROXY_AUTO", 1) != 0   # disk reset ke baad bhi API-list mode se hi shuru (server IP se nahi)
+FEED_ENV = os.environ.get("PROXY_FEED_URL", "").strip()               # default URL (dashboard se badal sakte ho)
+FEED_FILE = os.path.join(DATA, "feed.json")                           # dashboard se set: {"url": ...}
+FEED_MAX = max(100, env_int("FEED_MAX", 5000))                        # list me max itne proxy
+FEED_EVERY = max(120, env_int("FEED_EVERY_SEC", 300))                 # ~itne sec me list dobara (+-20% random)
+BROWSER_CLOSE_IDLE = env_int("BROWSER_CLOSE_IDLE", 1) != 0            # visit ke baad Chromium band (RAM khali), agli visit par phir khulega
 IDLE_REASON = "idle ke baad"
-POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 100)                        # proxy se jagane ke liye max wait (sec), phir seedha retry
-POOL_MEM_PAUSE = env_int("POOL_MEM_PAUSE_MB", 430)               # itni RAM (MB) se upar ho to test ruk jata hai
-# ---- khali time me scan: agli visit tak jitna time bacha, utne me proxy test (max POOL_TEST_MAX)
-POOL_IDLE = env_int("POOL_IDLE_SCAN", 1) != 0
-POOL_TEST_MAX = max(10, env_int("POOL_TEST_MAX", 120))                 # ek khali-window me max itne proxy
-POOL_IDLE_EVERY = max(2, env_int("POOL_IDLE_EVERY_MIN", 30)) * 60       # do idle scan ke beech kam se kam itna gap
-POOL_IDLE_MIN_WIN = env_int("POOL_IDLE_MIN_WINDOW_SEC", 90)            # agli visit me itna time ho tabhi scan shuru
-POOL_IDLE_MARGIN = env_int("POOL_IDLE_MARGIN_SEC", 40)                 # agli visit se itna pehle scan band
-POOL_KEEP_AGE = env_int("POOL_KEEP_AGE_MIN", 120) * 60  # 2 ghante se purana proxy delete
-POOL_ENOUGH = max(3, env_int("POOL_ENOUGH", 25))                       # itne chalte proxy mil jayein to test wahin ruk jaye
-POOL_TOPUP = max(3, env_int("POOL_TOPUP_BELOW", 20))                   # pool me isse kam proxy ho tabhi naya scan
-#                 # purane achhe proxy itni der pool me rakho
-POOL_DAILY_TESTS = env_int("POOL_DAILY_TESTS", 300)                      # 0 = roz ki koi limit nahi (number daalo to utne test roz)
-POOL_RETEST_SEC = 3600                                                 # ek proxy ko 1 ghante me dobara test nahi
-SCANNER_URL = os.environ.get("SCANNER_URL", "").strip().rstrip("/")     # alag scanner service ka URL (set ho to proxy test yahan nahi hoga)
-SCANNER_KEY = os.environ.get("SCANNER_KEY", "").strip()
-SCANNER_SYNC = max(30, env_int("SCANNER_SYNC_SEC", 120))              # itne sec me list dobara le
-SCANNER_FILE = os.path.join(DATA, "scanner.json")                      # dashboard se set: {"mode": "remote"|"local", "url", "key"}
-
-
-def scanner_cfg():
-    """-> (url, key). Dashboard ki file pehle, warna env. mode=local ho to ("", "") yani Render khud test karega."""
-    try:
-        with open(SCANNER_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            if d.get("mode") == "local":
-                return "", ""
-            if d.get("mode") == "remote" and d.get("url"):
-                return str(d["url"]).rstrip("/"), str(d.get("key") or "")
-    except (OSError, ValueError):
-        pass
-    return SCANNER_URL, SCANNER_KEY
-
-
-def scanner_alt():
-    """Dashboard me save kiya Cloudflare (mode local ho tab bhi) ya env wala. Render ka khud ka scan na chale to isse list lo."""
-    try:
-        with open(SCANNER_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict) and d.get("url"):
-            return str(d["url"]).rstrip("/"), str(d.get("key") or "")
-    except (OSError, ValueError):
-        pass
-    return SCANNER_URL, SCANNER_KEY
-
-
-def save_scanner(mode, url="", key=""):
-    os.makedirs(DATA, exist_ok=True)
-    tmp = SCANNER_FILE + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # key wali file sirf hamare liye
-    with os.fdopen(fd, "w") as f:
-        json.dump({"mode": mode, "url": url, "key": key}, f)
-    os.replace(tmp, SCANNER_FILE)
-
-
-def norm_scanner_url(raw):
-    """Sirf scheme://host (path/query hata do). Galat ho to None."""
-    raw = (raw or "").strip()
-    if raw and "://" not in raw:
-        raw = "https://" + raw
-    try:
-        u = urlparse(raw)
-        if u.scheme not in ("http", "https") or not u.hostname:
-            return None
-    except ValueError:
-        return None
-    return f"{u.scheme}://{u.netloc}"
-
-
-def scanner_fetch(url, key, timeout=15):
-    """Scanner ke /good se list lo -> dict. Fail par exception."""
-    full = url + "/good" + (f"?key={key}" if key else "")
-    req = urllib.request.Request(full, headers={"User-Agent": "keepalive"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read(2 * 1024 * 1024).decode("utf-8", "replace"))
-REUSE_HOURS = env_int("PROXY_REUSE_HOURS", 8)                          # itne ghante tak ke chale hue proxy dobara (cookies ke saath)
-REUSE_PCT = max(0, min(100, env_int("PROXY_REUSE_PCT", 90)))           # kitni visit me purana chala hua proxy pehle try ho
-REUSE_WAKE_MAX = env_int("REUSE_WAKE_MAX", 150)                        # purane chale hue proxy ko jagane ka max wait (sec)
+POOL_WAKE_MAX = env_int("POOL_WAKE_MAX", 100)                         # proxy se jagane ke liye max wait (sec), phir naya proxy
+POOL_NAV_TIMEOUT = max(15, env_int("POOL_NAV_TIMEOUT_SEC", 45))       # proxy se page kholne ka max wait (sec)
+POOL_PRECHECK_SEC = max(1.0, float(os.environ.get("POOL_PRECHECK_SEC", "2.5") or 2.5))   # visit se pehle sirf TCP connect check (test nahi)
+POOL_PRECHECK_TRIES = max(6, env_int("POOL_PRECHECK_TRIES", 18))      # ek visit ke liye max itne proxy ka connect check
+POOL_AVOID = max(20, env_int("POOL_AVOID_RECENT", 400))               # pichle itne use hue proxy dobara nahi chunte
+REUSE_HOURS = env_int("PROXY_REUSE_HOURS", 8)                         # (sirf REUSE_PCT>0 ho tab) itne ghante tak purana proxy
+REUSE_PCT = max(0, min(100, env_int("PROXY_REUSE_PCT", 0)))           # 0 = har visit naya proxy (default)
+REUSE_WAKE_MAX = env_int("REUSE_WAKE_MAX", 150)
 RECENT_FILE = os.path.join(DATA, "recent_px.json")
 RECENT = {"d": None}                                                   # {app_url: [{"hp","t","cc"}]}
-POOL_LIST_TTL = 1800                                                   # GitHub list 30 min cache (baar-baar download nahi)
-POOL_STATE = {"tested_at": {}, "day": "", "day_n": 0, "list": None, "list_t": 0.0}
-POOL_TEST_URL = os.environ.get("POOL_TEST_URL", "https://www.cloudflare.com/cdn-cgi/trace")
-POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 0) != 0   # 1 = proxy fail/pool khali ho to server ke IP se visit (default band: server IP kabhi nahi)
-POOL_START_TEST = max(10, env_int("POOL_START_TEST", 150))        # shuru me itne proxy pehle test, tabhi visit shuru
-POOL_MIN_READY = max(1, env_int("POOL_MIN_READY", 3))             # kam se kam itne chalte proxy mile to visit shuru
-POOL_RETRIES = max(0, env_int("POOL_RETRIES", 2))                 # proxy se visit fail ho to itni baar naye proxy se turant dobara
-POOL = {"good": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "tested": 0, "busy": False, "note": "abhi test nahi hua"}
+POOL_FALLBACK_DIRECT = env_int("POOL_FALLBACK_DIRECT", 0) != 0         # 1 = proxy na mile to server ke IP se visit (default band)
+POOL_RETRIES = max(0, env_int("POOL_RETRIES", 3))                      # proxy se visit fail ho to itni baar naye proxy se turant dobara
+POOL = {"list": [], "cc": {}, "bad": {}, "updated": None, "found": 0, "busy": False, "fails": 0, "ev_t": 0.0,
+        "note": "list abhi nahi aayi"}
 POOL_LOCK = threading.Lock()
 POOL_EVT = threading.Event()
 LAST_PX = {"hp": None}
-import ssl as _ssl
-_SSL_CTX = _ssl.create_default_context()      # sab tests isi ek context ko use karte hain (RAM bachti hai)
+USED = deque(maxlen=POOL_AVOID)
 _IPPORT = re.compile(r"(?:(socks5|socks4|https?)://)?(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})(?!\d)", re.I)
 
 
@@ -425,7 +336,70 @@ def proxy_auto():
     return POOL_AUTO_ENV and not PROXY_URL
 
 
-_LAST_EV = {"m": "", "t": 0.0}
+def feed_url():
+    """Dashboard ka URL pehle, warna env (PROXY_FEED_URL)."""
+    try:
+        with open(FEED_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get("url"):
+            return str(d["url"]).strip()
+    except (OSError, ValueError):
+        pass
+    return FEED_ENV
+
+
+def save_feed(url):
+    os.makedirs(DATA, exist_ok=True)
+    tmp = FEED_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # key wali file sirf hamare liye
+    with os.fdopen(fd, "w") as f:
+        json.dump({"url": url}, f)
+    os.replace(tmp, FEED_FILE)
+
+
+def norm_feed_url(raw):
+    raw = (raw or "").strip()
+    if raw and "://" not in raw:
+        raw = "https://" + raw
+    try:
+        u = urlparse(raw)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return None
+    except ValueError:
+        return None
+    return raw
+
+
+def mask_feed(url):
+    """Key dashboard par poori na dikhe: https://host/path?key=a86…"""
+    try:
+        u = urlparse(url)
+        q = re.sub(r"=([^&]{0,3})[^&]*", lambda m: "=" + m.group(1) + "…", u.query)
+        return f"{u.scheme}://{u.netloc}{u.path}" + (f"?{q}" if q else "")
+    except ValueError:
+        return "(invalid)"
+
+
+def feed_fetch(url, timeout=20):
+    """API se list -> ['socks5://ip:port', ...] (max FEED_MAX, duplicate hata ke). Fail par exception."""
+    req = urllib.request.Request(url, headers={"User-Agent": "keepalive"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(2 * 1024 * 1024)                      # 5000 line ~150 KB, 2 MB se upar kabhi nahi
+    out, seen = [], set()
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("https://"):   # TLS wali proxy: Chromium certificate reject karta hai
+            continue
+        m = _IPPORT.search(line)
+        if not m or not 0 < int(m.group(3)) < 65536:
+            continue
+        hp = f"{(m.group(1) or 'http').lower()}://{m.group(2)}:{m.group(3)}"
+        if hp not in seen:
+            seen.add(hp)
+            out.append(hp)
+            if len(out) >= FEED_MAX:
+                break
+    return out
 
 
 def log_event(msg):
@@ -436,6 +410,9 @@ def log_event(msg):
     log_add({"event": "proxy", "msg": msg})
 
 
+_LAST_EV = {"m": "", "t": 0.0}
+
+
 class NoProxy(RuntimeError):
     pass
 
@@ -443,64 +420,81 @@ class NoProxy(RuntimeError):
 def pool_good_n():
     now = time.time()
     with POOL_LOCK:
-        return sum(1 for g in POOL["good"] if POOL["bad"].get(g["hp"], 0) < now)
+        return max(0, len(POOL["list"]) - sum(1 for v in POOL["bad"].values() if v > now))
 
 
 def pool_ready():
-    """Free-auto mode me visit tabhi jab warm-up scan ho chuka ho aur kam se kam 1 chalta proxy ho (server IP se visit nahi)."""
+    """API-list mode me visit tabhi jab list me kam se kam 1 proxy ho (server IP se visit nahi)."""
     if not proxy_auto() or STATUS["engine"] == "obscura":
         return True
-    return bool(POOL_STATE.get("warm")) and pool_good_n() >= 1
+    return pool_good_n() >= 1
 
 
-def _scheme_for(src):
-    """List ke naam se default scheme: socks5.txt -> socks5, socks4.txt -> socks4, baaki http."""
-    l = src.lower()
-    return "socks5" if "socks5" in l else ("socks4" if "socks4" in l else "http")
+def pool_set(lst, quiet=False):
+    """Nayi list ek jhatke me badlo (lock sirf swap tak)."""
+    now = time.time()
+    with POOL_LOCK:
+        POOL["list"] = lst
+        POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > now}
+        POOL["updated"], POOL["found"], POOL["fails"] = now, len(lst), 0
+        POOL["note"] = f"API se {len(lst)} proxy"
+        hourly = now - POOL["ev_t"] > 3600
+        if hourly:
+            POOL["ev_t"] = now
+    log("pool:", f"API se {len(lst)} proxy")
+    if hourly and not quiet:
+        log_add({"event": "proxy", "msg": f"proxy list update: {len(lst)} proxy (har ~5 min me aati hai, yahan ghante me ek baar likhta hoon)"})
 
 
-def _get_list(src):
-    """-> ['http://ip:port', 'socks5://ip:port', ...]. Line par scheme likha ho to wahi, warna list ke naam wala."""
-    default = _scheme_for(src)
-    req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        txt = r.read(3 * 1024 * 1024).decode("utf-8", "replace")
-    out = []
-    for line in txt.splitlines():
-        line = line.strip()
-        if line.lower().startswith("https://"):
-            continue                      # TLS wali proxy (Chromium certificate reject karta hai)
-        m = _IPPORT.search(line)
-        if m and 0 < int(m.group(3)) < 65536:
-            out.append(f"{(m.group(1) or default).lower()}://{m.group(2)}:{m.group(3)}")
-    return out
+def pool_feed_sync(url=None):
+    """List download karo aur pool badlo. Fail ho to purani list chalti rehti hai. -> True/False."""
+    url = url or feed_url()
+    if not url:
+        with POOL_LOCK:
+            POOL["note"] = "proxy list ka URL set nahi hai"
+        return False
+    with POOL_LOCK:
+        POOL["busy"] = True
+    try:
+        lst = feed_fetch(url)
+        if not lst:
+            raise ValueError("list khali")
+        pool_set(lst)
+        return True
+    except Exception as e:
+        with POOL_LOCK:
+            POOL["fails"] += 1
+            why = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+            POOL["note"] = f"list nahi mili ({why}), purani chal rahi hai"
+        log("pool: list fetch fail:", type(e).__name__, str(e)[:100])
+        return False
+    finally:
+        with POOL_LOCK:
+            POOL["busy"] = False
 
 
-def _fetch_job(job):
-    cc, srcs = job
-    for src in srcs:
+def pool_loop():
+    """Alag thread: ~5 min (random +-20%) me list lo. Visit ke beech me ho to uske gap tak (max 45 sec) ruko, kisi visit ko rokta nahi."""
+    while True:
+        wait = 20
         try:
-            out = _get_list(src)
-            if out:
-                return cc, src, out
-        except Exception:
-            continue
-    return cc, srcs[0], []
+            if proxy_auto() and STATUS["engine"] != "obscura" and feed_url():
+                POOL_EVT.clear()
+                w = 0
+                while STATUS.get("visiting") and w < 45:
+                    time.sleep(random.uniform(3, 6))
+                    w += 4
+                ok = pool_feed_sync()
+                wait = FEED_EVERY * random.uniform(0.8, 1.2) if ok else min(300, 30 * (1 + POOL["fails"])) * random.uniform(0.8, 1.2)
+        except Exception as e:
+            log("pool loop error:", type(e).__name__)
+            wait = 30
+        POOL_EVT.wait(timeout=wait)
 
 
-def pool_fetch():
-    """-> {ip:port: country ya None}"""
-    from concurrent.futures import ThreadPoolExecutor
-    jobs = [(None, [s]) for s in POOL_SOURCES]
-    jobs += [(c, [f"{IPLOC}{c}/proxies.txt"]) for c in POOL_COUNTRIES]
-    found = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for cc, src, out in ex.map(_fetch_job, jobs):
-            log(f"pool: {cc or 'list'} {src.split('/')[4:6]} -> {len(out)} proxy")
-            for hp in out:
-                if cc or hp not in found:
-                    found[hp] = cc
-    return found
+def chrome_busy():
+    """Visit chal rahi hai ya (idle-close mode me) Chrome khula hai -> backup mat chalao."""
+    return bool(STATUS.get("visiting") or (BROWSER_CLOSE_IDLE and BROWSER is not None and pool_ready()))
 
 
 def _recent_load():
@@ -525,20 +519,21 @@ def _recent_save():
 
 
 def recent_add(url, hp):
-    """Visit chal gayi: ye proxy is app ke liye 'chala hua' yaad rakho (cookie file isi proxy ke naam se hai)."""
-    if not hp:
+    """Visit chal gayi: ye proxy is app ke liye 'chala hua' yaad rakho (sirf REUSE_PCT>0 ho tab kaam aata hai)."""
+    if not hp or REUSE_PCT <= 0:
         return
     with POOL_LOCK:
         d = _recent_load()
         now = time.time()
-        cc = POOL["cc"].get(hp) or next((x.get("cc") for v in d.values() for x in v if x["hp"] == hp and x.get("cc")), None)
         lst = [x for x in d.get(url, []) if x["hp"] != hp and now - x["t"] < REUSE_HOURS * 3600]
-        lst.insert(0, {"hp": hp, "t": now, "cc": cc})
+        lst.insert(0, {"hp": hp, "t": now, "cc": POOL["cc"].get(hp)})
         d[url] = lst[:5]
         _recent_save()
 
 
 def recent_drop(hp):
+    if not RECENT["d"]:
+        return
     with POOL_LOCK:
         d = _recent_load()
         ch = False
@@ -551,287 +546,78 @@ def recent_drop(hp):
 
 
 def pool_country(hp):
-    c = POOL["cc"].get(hp)
-    if c:
-        return c
-    for v in (RECENT["d"] or {}).values():          # pool se hat chuka ho to bhi desh wahi (phone/timezone na badle)
-        for x in v:
-            if x["hp"] == hp and x.get("cc"):
-                return x["cc"]
-    return None
+    return POOL["cc"].get(hp)        # API se desh nahi aata, to aam taur par None (phone India wala default)
 
 
-def _test_socks(hp):
-    import socks, ssl
-    sch, _, hostport = hp.partition("://")
-    host, _, port = hostport.rpartition(":")
-    sk = socks.socksocket()
-    sk.set_proxy(socks.SOCKS5 if sch == "socks5" else socks.SOCKS4, host, int(port), rdns=(sch == "socks5"))
-    sk.settimeout(POOL_MAX_MS / 1000.0)
-    th = urlparse(POOL_TEST_URL)
+def tcp_alive(hp, timeout):
+    """Sirf TCP connect (test nahi): ~1 KB RAM, dead proxy 2-3 sec me pakda jata hai, 90 sec browser me atakta nahi."""
+    import socket
+    host, _, port = hp.partition("://")[2].rpartition(":")
     try:
-        sk.connect((th.hostname, th.port or 443))
-        ss = _SSL_CTX.wrap_socket(sk, server_hostname=th.hostname)   # certificate verify
-        ss.sendall(f"GET {th.path or '/'} HTTP/1.1\r\nHost: {th.hostname}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".encode())
-        head = ss.recv(256)
-        ss.close()
-    finally:
-        try:
-            sk.close()
-        except Exception:
-            pass
-    return head.startswith(b"HTTP/1.") and b" 200" in head[:16]
+        socket.create_connection((host, int(port)), timeout=timeout).close()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def pool_test_one(hp):
-    """HTTPS test. http proxy: CONNECT, socks4/socks5: PySocks. Certificate verify hota hai, to beech me padhne wali proxy khud hat jati hai."""
-    t0 = time.time()
+GEO = {}   # {hp: (cc, timezone)} ya None (lookup fail -> India default)
+
+
+def geo_lookup(hp):
+    """Sirf chune hue ek proxy ka desh+timezone (ip-api.com, ~0.2 sec, bahut kam RAM). Fail ho to None = India wala default."""
+    if hp in GEO:
+        return GEO[hp]
+    res = None
     try:
-        if hp.startswith("socks"):
-            if not _test_socks(hp):
-                return None
-        else:
-            ph = urllib.request.ProxyHandler({"http": hp, "https": hp})
-            op = urllib.request.build_opener(ph, urllib.request.HTTPSHandler(context=_SSL_CTX))
-            req = urllib.request.Request(POOL_TEST_URL, headers={"User-Agent": "Mozilla/5.0"})
-            with op.open(req, timeout=POOL_MAX_MS / 1000.0) as r:
-                r.read(2048)
-                if r.status != 200:
-                    return None
+        ip = hp.partition("://")[2].rpartition(":")[0]
+        req = urllib.request.Request(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone",
+                                     headers={"User-Agent": "keepalive"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            d = json.loads(r.read(2048).decode("utf-8", "replace"))
+        if d.get("status") == "success" and d.get("countryCode"):
+            res = (str(d["countryCode"]).upper(), str(d.get("timezone") or ""))
+            with POOL_LOCK:
+                POOL["cc"][hp] = res[0]
     except Exception:
-        return None
-    ms = int((time.time() - t0) * 1000)
-    return {"hp": hp, "ms": ms} if ms <= POOL_MAX_MS else None
-
-
-def pool_refresh(deadline=None, limit=None):
-    """deadline (time.time() ka number) ho to khali-window scan: us time se pehle ruk jao. None = purana poora scan."""
-    from concurrent.futures import ThreadPoolExecutor
-    with POOL_LOCK:
-        POOL["busy"] = True
-    try:
-        t0 = time.time()
-        if POOL_STATE["list"] is None or t0 - POOL_STATE["list_t"] > POOL_LIST_TTL:
-            POOL_STATE["list"] = pool_fetch()
-            POOL_STATE["list_t"] = t0
-        ccmap = POOL_STATE["list"]
-        allp = list(ccmap)
-        random.shuffle(allp)
-        ta = POOL_STATE["tested_at"]
-        fresh = [x for x in allp if ta.get(x, 0) < t0 - POOL_RETEST_SEC]    # jo abhi test nahi hue unhe pehle
-        if not fresh:
-            ta.clear()
-            fresh = allp
-        limit = limit or (POOL_TEST_MAX if deadline else POOL_TEST_N)
-        today = time.strftime("%Y%m%d", time.gmtime(t0 + TZ_MIN * 60))
-        if POOL_STATE["day"] != today:
-            POOL_STATE["day"], POOL_STATE["day_n"] = today, 0
-        if deadline and POOL_DAILY_TESTS > 0:
-            limit = min(limit, POOL_DAILY_TESTS - POOL_STATE["day_n"])
-        sample = fresh[:max(0, limit)]
-        good = []
-        done = 0
-        why = ""
-        with POOL_LOCK:
-            POOL["prog"] = {"done": 0, "total": len(sample), "good": 0, "t0": t0}
-        est = 25.0                                  # ek batch ka andaza (sec), pehle batch ke baad asli number
-        for i in range(0, len(sample), POOL_BATCH):
-            if deadline:
-                nxt = STATUS.get("next") or deadline
-                if STATUS["running"] or STATUS.get("visiting") or time.time() + est > min(deadline, nxt - POOL_IDLE_MARGIN):
-                    why = " (agli visit paas aa gayi, yahin roka)"
-                    break
-            if chrome_busy():   # Chrome chal raha hai: scan yahin roko
-                why = " (Chrome chal raha hai, yahin roka)"
-                break
-            waited = 0
-            while mem_mb() > POOL_MEM_PAUSE and waited < 90:      # RAM zyada hai: thoda ruko, crash se bachao
-                time.sleep(5)
-                waited += 5
-            if mem_mb() > POOL_MEM_PAUSE:
-                why = " (RAM ki wajah se beech me roka)"
-                log(f"pool: RAM {mem_mb():.0f} MB > {POOL_MEM_PAUSE} MB, test yahin roka ({done}/{len(sample)} ho chuke)")
-                break
-            batch = sample[i:i + POOL_BATCH]
-            bt = time.time()
-            with ThreadPoolExecutor(max_workers=POOL_WORKERS) as ex:
-                for res in ex.map(pool_test_one, batch):
-                    if res:
-                        res["t"] = time.time()
-                        good.append(res)
-            est = max(10.0, time.time() - bt)
-            done += len(batch)
-            with POOL_LOCK:
-                POOL["prog"] = {"done": done, "total": len(sample), "good": len(good), "t0": t0}
-            POOL_STATE["day_n"] += len(batch)
-            for x in batch:
-                ta[x] = time.time()
-            import gc
-            gc.collect()
-            if len(good) >= POOL_ENOUGH:
-                why = " (kaafi proxy mil gaye, test band)"
-                break
-        # purane achhe proxy (jo bad mark nahi hue aur bahut purane nahi) naye ke saath rakho
-        now = time.time()
-        with POOL_LOCK:
-            have = {g["hp"] for g in good}
-            old = [g for g in POOL["good"] if g["hp"] not in have and now - g.get("t", now) < POOL_KEEP_AGE
-                   and POOL["bad"].get(g["hp"], 0) < now]
-            oldcc = dict(POOL["cc"])
-        merged = sorted(good + old, key=lambda g: g["ms"])[:POOL_KEEP]
-        with POOL_LOCK:
-            POOL["good"] = merged
-            POOL["cc"] = {g["hp"]: (ccmap.get(g["hp"]) or oldcc.get(g["hp"])) for g in merged}
-            POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > time.time()}
-            POOL["found"], POOL["tested"], POOL["updated"] = len(allp), done, time.time()
-            POOL["note"] = (f"{done} test, {len(good)} naye chale, pool me {len(merged)}"
-                            + (f", sabse tez {merged[0]['ms']} ms" if merged else "") + why
-                            + f" | aaj {POOL_STATE['day_n']}" + (f"/{POOL_DAILY_TESTS}" if POOL_DAILY_TESTS > 0 else "") + " test")
-        msg = f"free proxy pool: {POOL['note']}"
-        log(msg)
-        log_add({"event": "proxy", "msg": msg})
-    except Exception as e:
-        with POOL_LOCK:
-            POOL["note"] = f"refresh fail: {type(e).__name__}"
-        log("pool refresh failed:", type(e).__name__, str(e)[:100])
-    finally:
-        with POOL_LOCK:
-            POOL["busy"] = False
-            POOL["prog"] = None
-
-
-def pool_sync_scanner(url=None, key=None):
-    """Scanner service se tez proxy ki list lo (khud test nahi, RAM bachti hai). Fail ho to purani list rakho."""
-    try:
-        s_url, s_key = (url, key or "") if url else scanner_cfg()
-        if not s_url:
-            return
-        d = scanner_fetch(s_url, s_key, timeout=60)               # scanner so raha ho to jaagne me time lagta hai
-        now = time.time()
-        good = [{"hp": g["hp"], "ms": int(g.get("ms", 3000)), "t": now} for g in d.get("good", [])
-                if isinstance(g, dict) and check_proxy(g.get("hp"))]
-        if not good:
-            with POOL_LOCK:
-                POOL["note"] = "scanner se list khali aayi (purani rakhi)"
-            return
-        with POOL_LOCK:
-            POOL["good"] = good
-            for g, src in zip(good, [x for x in d["good"] if isinstance(x, dict) and check_proxy(x.get("hp"))]):
-                if src.get("cc"):
-                    POOL["cc"][g["hp"]] = src["cc"]
-            POOL["bad"] = {k: v for k, v in POOL["bad"].items() if v > now}
-            POOL["updated"] = now
-            POOL["found"], POOL["tested"] = d.get("count", len(good)), 0
-            POOL["note"] = f"scanner se {len(good)} proxy, sabse tez {min(g['ms'] for g in good)} ms"
-            POOL_STATE["warm"] = True
-        log("pool:", POOL["note"])
-    except Exception as e:
-        with POOL_LOCK:
-            POOL["note"] = f"scanner se list nahi mili: {type(e).__name__}"
-        log("scanner sync failed:", type(e).__name__, str(e)[:100])
-
-
-def pool_loop():
-    last = 0.0
-    last_warm = 0.0
-    while True:
-        try:
-            if scanner_cfg()[0] and proxy_auto() and STATUS["engine"] != "obscura":
-                if POOL_EVT.is_set() or time.time() - last >= SCANNER_SYNC:
-                    POOL_EVT.clear()
-                    pool_sync_scanner()
-                    last = time.time()
-                POOL_EVT.wait(timeout=15)
-                continue
-            if proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"] and not pool_ready():
-                # warm-up (ya pool poora khali): visit ruki hain, pehle bada scan (daily limit se alag)
-                if time.time() - last_warm >= 20:
-                    last_warm = time.time()
-                    POOL_EVT.clear()
-                    log(f"pool: {POOL_START_TEST} proxy ka scan shuru, tab tak visit ruki hain")
-                    pool_refresh(limit=POOL_START_TEST)
-                    if pool_good_n() < POOL_MIN_READY:
-                        a_url, a_key = scanner_alt()
-                        if a_url:                                   # Render khud na dhoondh paye to Cloudflare se list
-                            log("pool: Render ke scan se kam proxy mile, Cloudflare scanner se list le raha hoon")
-                            pool_sync_scanner(a_url, a_key)
-                    if pool_good_n() >= POOL_MIN_READY or (POOL_STATE.get("warm") and pool_good_n() >= 1):
-                        POOL_STATE["warm"] = True
-                        log_add({"event": "proxy", "msg": f"pool tayyar ({pool_good_n()} proxy), visit shuru"})
-                    last = time.time()
-            elif proxy_auto() and STATUS["engine"] != "obscura" and not POOL["busy"]:
-                now = time.time()
-                browser_free = (not BROWSER_CLOSE_IDLE) or BROWSER is None or now - last > POOL_REFRESH * 3
-                low = pool_good_n() < POOL_TOPUP
-                forced = POOL_EVT.is_set() or (last == 0.0 and low)          # dashboard se "Free auto" ya server start (pool kam ho tabhi)
-                if chrome_busy() and not POOL_EVT.is_set():
-                    browser_free = False                                     # Chrome khula hai: scan nahi
-                if browser_free and (forced or (not POOL_IDLE and low and now - last > POOL_REFRESH)):
-                    POOL_EVT.clear()
-                    pool_refresh()
-                    last = time.time()
-                elif (POOL_IDLE and not STATUS["running"] and not chrome_busy()
-                      and pool_good_n() < POOL_TOPUP and now - last >= POOL_IDLE_EVERY):
-                    nxt = STATUS.get("next")
-                    if nxt and nxt - now >= POOL_IDLE_MIN_WIN:               # agli visit tak khali time hai
-                        pool_refresh(deadline=nxt - POOL_IDLE_MARGIN)
-                        last = time.time()
-            pool_expire()
-        except Exception as e:
-            log("pool loop error:", type(e).__name__)
-        POOL_EVT.wait(timeout=10 if (proxy_auto() and not pool_ready()) else 30)
-
-
-def chrome_busy():
-    """Visit chal rahi hai ya (idle-close mode me) Chrome khula hai -> scan/backup mat chalao."""
-    return bool(STATUS.get("visiting") or (BROWSER_CLOSE_IDLE and BROWSER is not None and pool_ready()))
-
-
-def pool_expire():
-    """POOL_KEEP_AGE (2 ghante) se purane proxy pool, recent list aur yaad-dasht se hata do."""
-    now = time.time()
-    cut = now - POOL_KEEP_AGE
-    gone = []
-    with POOL_LOCK:
-        keep = []
-        for g in POOL["good"]:
-            g.setdefault("t", now)
-            (keep if g["t"] >= cut else gone).append(g)
-        if gone:
-            POOL["good"] = keep
-            for g in gone:
-                POOL["cc"].pop(g["hp"], None)
-        for k in [k for k, v in POOL["bad"].items() if v <= now]:
-            del POOL["bad"][k]
-        ta = POOL_STATE["tested_at"]
-        for k in [k for k, v in ta.items() if v < now - POOL_RETEST_SEC]:
-            del ta[k]
-        d = _recent_load()
-        ch = False
-        for u in list(d):
-            n = [x for x in d[u] if x["t"] >= cut]
-            if len(n) != len(d[u]):
-                d[u], ch = n, True
-        if ch:
-            _recent_save()
-    if gone:
-        log(f"pool: {len(gone)} purane proxy (2 ghante+) delete, bache {pool_good_n()}")
+        res = None
+    if len(GEO) > 2000:
+        GEO.clear()
+    GEO[hp] = res
+    return res
 
 
 def pool_pick(url=None):
-    """-> (proxy, reused). Pehle is app ka pichle REUSE_HOURS me chala hua proxy (usi ki cookies), warna pool se random."""
+    """-> (proxy, reused). Har visit naya random proxy: pichle POOL_AVOID use hue aur bad-marked nahi.
+    Chunne ke baad sirf TCP connect check (6 ek saath); dead ho to agla."""
+    from concurrent.futures import ThreadPoolExecutor
     now = time.time()
     with POOL_LOCK:
-        good = [g for g in POOL["good"] if POOL["bad"].get(g["hp"], 0) < now]
-        rec = []
-        if url:
+        pool, bad = POOL["list"], POOL["bad"]
+        if not pool:
+            return None, False
+        if url and REUSE_PCT > 0:
             rec = [x for x in _recent_load().get(url, [])
-                   if now - x["t"] < REUSE_HOURS * 3600 and POOL["bad"].get(x["hp"], 0) < now]
-    if rec and random.random() * 100 < REUSE_PCT:
-        return rec[0]["hp"], True                    # sabse nayi chali hui
-    if not good:
-        return None, False
-    return random.choices(good, weights=[1.0 / max(g["ms"], 300) for g in good])[0]["hp"], False   # tez wale zyada chunenge
+                   if now - x["t"] < REUSE_HOURS * 3600 and bad.get(x["hp"], 0) < now]
+            if rec and random.random() * 100 < REUSE_PCT:
+                return rec[0]["hp"], True
+        used = set(USED)
+        sample = random.sample(pool, min(len(pool), POOL_PRECHECK_TRIES * 4))
+        cands = [h for h in sample if bad.get(h, 0) < now and h not in used]
+        if len(cands) < POOL_PRECHECK_TRIES:                 # list chhoti hai: used wale bhi chalenge (par bad nahi)
+            cands += [h for h in sample if bad.get(h, 0) < now and h in used]
+    for i in range(0, min(len(cands), POOL_PRECHECK_TRIES), 6):
+        batch = cands[i:i + 6]
+        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+            res = list(ex.map(lambda h: tcp_alive(h, POOL_PRECHECK_SEC), batch))
+        with POOL_LOCK:
+            for h, ok in zip(batch, res):
+                if not ok:
+                    POOL["bad"][h] = time.time() + 3600
+        alive = [h for h, ok in zip(batch, res) if ok]
+        if alive:
+            USED.append(alive[0])
+            return alive[0], False
+    return None, False
 
 
 def pool_mark_bad(hp, why=""):
@@ -1033,6 +819,14 @@ COUNTRY_LOC = {
     "IN": ("en-IN", "Asia/Kolkata"), "US": ("en-US", "America/New_York"), "GB": ("en-GB", "Europe/London"),
     "DE": ("de-DE", "Europe/Berlin"), "FR": ("fr-FR", "Europe/Paris"), "NL": ("nl-NL", "Europe/Amsterdam"),
     "SG": ("en-SG", "Asia/Singapore"), "BR": ("pt-BR", "America/Sao_Paulo"), "ID": ("id-ID", "Asia/Jakarta"),
+    "RU": ("ru-RU", "Europe/Moscow"), "UA": ("uk-UA", "Europe/Kyiv"), "TR": ("tr-TR", "Europe/Istanbul"),
+    "PL": ("pl-PL", "Europe/Warsaw"), "IT": ("it-IT", "Europe/Rome"), "ES": ("es-ES", "Europe/Madrid"),
+    "TH": ("th-TH", "Asia/Bangkok"), "VN": ("vi-VN", "Asia/Ho_Chi_Minh"), "PH": ("en-PH", "Asia/Manila"),
+    "BD": ("bn-BD", "Asia/Dhaka"), "PK": ("ur-PK", "Asia/Karachi"), "MX": ("es-MX", "America/Mexico_City"),
+    "AR": ("es-AR", "America/Argentina/Buenos_Aires"), "CO": ("es-CO", "America/Bogota"), "EC": ("es-EC", "America/Guayaquil"),
+    "ZA": ("en-ZA", "Africa/Johannesburg"), "NG": ("en-NG", "Africa/Lagos"), "EG": ("ar-EG", "Africa/Cairo"),
+    "JP": ("ja-JP", "Asia/Tokyo"), "KR": ("ko-KR", "Asia/Seoul"), "HK": ("zh-HK", "Asia/Hong_Kong"),
+    "CA": ("en-CA", "America/Toronto"), "AU": ("en-AU", "Australia/Sydney"), "MY": ("ms-MY", "Asia/Kuala_Lumpur"),
 }
 _TZ_STD = {"Asia/Kolkata": 330, "America/New_York": -300, "Europe/London": 0, "Europe/Berlin": 60, "Europe/Paris": 60,
            "Europe/Amsterdam": 60, "Asia/Singapore": 480, "America/Sao_Paulo": -180, "Asia/Jakarta": 420}
@@ -1071,7 +865,18 @@ def get_fingerprint(url, px=None):
         return fp
     h = int(hashlib.sha1(("fp|" + px).encode()).hexdigest(), 16)
     model, ver, (w, hh), dpr, cores, ram, gv, gr, _yr = pick_phone(h)
-    lang, tz = COUNTRY_LOC.get(pool_country(px) or "IN", COUNTRY_LOC["IN"])
+    geo = GEO.get(px)
+    cc = geo[0] if geo else "IN"
+    lang, tz = COUNTRY_LOC.get(cc, ("en-US", None))
+    if geo and geo[1]:
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(geo[1])
+            tz = geo[1]                                  # API ka asli timezone
+        except Exception:
+            pass
+    if not geo or not tz:
+        lang, tz = COUNTRY_LOC["IN"]                     # lookup fail / timezone nahi mila: India
     fp.update({
         "ua": android_ua(model, ver), "viewport": {"width": w, "height": hh}, "screen": {"width": w, "height": hh},
         "dpr": dpr, "hardware_concurrency": cores, "device_memory": ram, "language": lang, "timezone_id": tz,
@@ -1592,6 +1397,8 @@ def human_dwell(page, url, obs, touch):
 
 def visit(browser, url, direct=False):
     px, reused = pool_pick(url) if (proxy_auto() and not direct and STATUS["engine"] != "obscura") else (None, False)
+    if px:
+        geo_lookup(px)                                  # proxy ka desh/timezone (fail ho to India default)
     sp = state_path(url, px)                            # is proxy IP ki apni cookie file
     wake_max = (REUSE_WAKE_MAX if reused else POOL_WAKE_MAX) if px else WAKE_MAX   # purana chala hua proxy: zyada sabr
     fp = get_fingerprint(url, px)                       # proxy ke hisaab se alag phone (px None to default phone)
@@ -1701,7 +1508,7 @@ def visit(browser, url, direct=False):
 
     def load():
         try:
-            r = page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            r = page.goto(url, wait_until="domcontentloaded", timeout=(POOL_NAV_TIMEOUT * 1000 if px else 90000))
             return (r.status if r else None), (r.headers.get("x-blitz-gate") if r else None)
         except Exception as e:
             return None, f"err:{type(e).__name__}"
@@ -1976,9 +1783,6 @@ def run_one(u):
     """Visit ke dauran STATUS["visiting"]=True (scan/backup isi se ruk-te hain)."""
     if not pool_ready():
         return _run_one(u)
-    t = time.time()
-    while POOL["busy"] and time.time() - t < 45:       # chalta hua scan batch khatam hone do, phir Chrome kholo
-        time.sleep(1)
     STATUS["visiting"] = True
     try:
         return _run_one(u)
@@ -1991,7 +1795,7 @@ def _run_one(u):
     if not pool_ready():                                  # proxy tayyar nahi: server IP se visit nahi, baad me
         if time.time() - NOTE_T["gate"] > 600:
             NOTE_T["gate"] = time.time()
-            log_add({"event": "proxy", "msg": "visit ruki hain: proxy pool tayyar nahi (scan chal raha hai)"})
+            log_add({"event": "proxy", "msg": "visit ruki hain: proxy list abhi tak nahi aayi (dashboard me URL check karo)"})
         return None
     for attempt in (1, 2):
         try:
@@ -2142,24 +1946,38 @@ def self_ping():
 
 # ---------------------------------------------------------------- dashboard
 CSS = """
-:root{--bg:#f4f5f8;--card:#fff;--tx:#1b1d22;--mu:#6b7280;--ln:#e8eaf0;--ac:#2563eb;--ok:#0f9d58;--bad:#d93025;--warn:#d97706}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#181b22;--tx:#e8eaf0;--mu:#9aa3b2;--ln:#262a34;--ac:#4f8cff}}
-*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:12px;background:var(--bg);color:var(--tx);font-size:15px;max-width:760px;margin:auto}
-h1{font-size:20px;margin:6px 0}h2{font-size:15px;margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px}
-.card{background:var(--card);border-radius:14px;padding:14px;margin:12px 0;border:1px solid var(--ln)}
-.mu{color:var(--mu);font-size:12px;line-height:1.5}.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}.warn{color:var(--warn);font-weight:600}
-.chip{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ln);margin:2px 4px 2px 0}
-.chip.g{background:#0f9d5822;color:var(--ok)}.chip.r{background:#d9302222;color:var(--bad)}.chip.y{background:#d9770622;color:var(--warn)}
-.bar{height:9px;background:var(--ln);border-radius:9px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;background:var(--ac);border-radius:9px}
-.bar.mem i{background:var(--ok)}.bar.mem.hi i{background:var(--warn)}
-.row{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--ln)}.row:last-child{border:0}
-.row b{word-break:break-all}
-input[type=text],input[type=password]{display:block;width:100%;padding:11px;margin:6px 0;border:1px solid var(--ln);border-radius:10px;font-size:15px;background:var(--bg);color:var(--tx)}
-.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}.btns button{flex:1 1 140px}
-button{padding:11px 14px;border:0;border-radius:10px;background:var(--ac);color:#fff;font-size:14px;font-weight:600}
-button.red{background:var(--bad)}button.grey{background:#59606e}button.sm{padding:6px 11px;flex:none}button:disabled{opacity:.5}
-form{margin:0}.lg{padding:8px 0;border-bottom:1px solid var(--ln);font-size:13px;line-height:1.45}.lg:last-child{border:0}.lg .t{color:var(--mu);font-size:11px}
-.ev{color:var(--mu);font-style:italic}a{color:var(--ac)}code{background:var(--ln);padding:1px 5px;border-radius:5px;font-size:12px;word-break:break-all}
+:root{--bg:#f6f7f9;--card:#fff;--tx:#0f172a;--mu:#64748b;--ln:#e6e9ef;--ac:#4f46e5;--acbg:#eef2ff;--ok:#059669;--okbg:#ecfdf5;--bad:#dc2626;--badbg:#fef2f2;--warn:#b45309;--warnbg:#fffbeb}
+*{box-sizing:border-box}html{color-scheme:light}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:18px 14px 40px}
+.top{display:flex;justify-content:space-between;align-items:center;margin:2px 2px 16px}
+h1{font-size:22px;font-weight:700;letter-spacing:-.02em;margin:0}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:99px;font-size:12px;font-weight:600;background:var(--okbg);color:var(--ok)}
+.pill:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+.pill.y{background:var(--warnbg);color:var(--warn)}.pill.r{background:var(--badbg);color:var(--bad)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat{background:var(--card);border:1px solid var(--ln);border-radius:16px;padding:14px}
+.stat .k{color:var(--mu);font-size:12px;font-weight:500}
+.stat .v{font-size:23px;font-weight:700;letter-spacing:-.02em;margin-top:1px}
+.stat .s{color:var(--mu);font-size:12px}
+.bar{height:6px;background:var(--ln);border-radius:9px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:var(--ok);border-radius:9px}.bar.hi i{background:#d97706}
+.card{background:var(--card);border:1px solid var(--ln);border-radius:18px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+h2{font-size:14px;font-weight:650;margin:0 0 12px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.mu{color:var(--mu);font-size:12px;line-height:1.55}.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+.chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600;background:#f1f3f7;color:#475569;margin:2px 4px 2px 0}
+.chip.g{background:var(--okbg);color:var(--ok)}.chip.r{background:var(--badbg);color:var(--bad)}.chip.y{background:var(--warnbg);color:var(--warn)}
+.row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--ln)}.row:last-of-type{border:0}
+.row .rt{flex:1;min-width:0}.row b{display:block;font-weight:600;word-break:break-all}
+.dot{width:9px;height:9px;border-radius:50%;background:#cbd5e1;flex:none}.dot.g{background:#10b981}.dot.r{background:#ef4444}
+input[type=text],input[type=password]{display:block;width:100%;padding:12px 13px;margin:8px 0 0;border:1px solid var(--ln);border-radius:12px;font-size:15px;background:#fbfcfd;color:var(--tx);outline:none}
+input:focus{border-color:var(--ac);background:#fff;box-shadow:0 0 0 3px var(--acbg)}
+.btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.btns button{flex:1 1 130px}
+button{padding:11px 15px;border:0;border-radius:12px;background:var(--ac);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+button.soft{background:var(--acbg);color:var(--ac)}button.ghost{background:#f1f3f7;color:#475569}button.red{background:var(--badbg);color:var(--bad)}
+button.sm{padding:7px 12px;flex:none;font-size:13px}button:disabled{opacity:.5}
+form{margin:0}details{margin-top:14px;border-top:1px solid var(--ln);padding-top:12px}summary{cursor:pointer;color:var(--mu);font-size:13px;font-weight:600}
+.lg{padding:10px 0;border-bottom:1px solid var(--ln);font-size:13px;line-height:1.5}.lg:last-child{border:0}.lg .t{color:var(--mu);font-size:11px}
+.ev{color:var(--mu)}a{color:var(--ac);text-decoration:none;font-weight:600;font-size:12px}code{background:#f1f3f7;padding:2px 6px;border-radius:6px;font-size:12px;word-break:break-all}
 """
 
 
@@ -2177,20 +1995,26 @@ def dashboard():
     entries = log_read(now - LOG_DAYS * 86400)
     day = [e for e in entries if e.get("t", 0) >= now - 86400 and "url" in e]
     # ---- apps
-    app_rows = []
+    app_rows, awake_n = [], 0
     for u in apps:
         mine = [e for e in entries if e.get("url") == u]
         last = mine[-1] if mine else None
         d24 = [e for e in day if e["url"] == u]
         slept = sum(1 for e in d24 if e.get("was_asleep"))
-        st = (_chip("AWAKE", "g") if last.get("ok") else _chip("ASLEEP", "r")) if last else _chip("abhi visit nahi")
+        if last and last.get("ok"):
+            awake_n += 1
+            dot, st = "g", '<span class="ok">AWAKE</span>'
+        elif last:
+            dot, st = "r", '<span class="bad">ASLEEP</span>'
+        else:
+            dot, st = "", "abhi visit nahi"
         when = fmt_t(last["t"]) if last else "-"
         app_rows.append(
-            f'<div class="row"><div><b>{esc(u.replace("https://", "").replace("http://", ""))}</b><br>{st}'
-            f'<span class="mu">aakhri: {when} &middot; 24h me so raha tha {slept}/{len(d24)}</span></div>'
+            f'<div class="row"><span class="dot {dot}"></span><div class="rt"><b>{esc(u.replace("https://", "").replace("http://", "").strip("/"))}</b>'
+            f'<span class="mu">{st} &middot; aakhri {when} &middot; 24h me so raha tha {slept}/{len(d24)}</span></div>'
             f'<form method="post" action="/del" onsubmit="return confirm(\'Hata dun?\')">'
-            f'<input type="hidden" name="url" value="{esc(u)}"><button class="red sm">Delete</button></form></div>')
-    # ---- log (cards, no wide table)
+            f'<input type="hidden" name="url" value="{esc(u)}"><button class="red sm">Hatao</button></form></div>')
+    # ---- log
     logs = []
     for e in reversed(entries[-60:]):
         if "event" in e:
@@ -2210,81 +2034,68 @@ def dashboard():
             f'{esc(e.get("phone") or "-")}{" A" + esc(e["android"]) if e.get("android") else ""} &middot; '
             f'{"cookies" if e.get("cookies") else "nayi"}'
             f'{" &middot; RAM " + str(e["mem"]) + " MB" if e.get("mem") else ""}</span></div>')
-    # ---- status header
+    # ---- status
     nxt = STATUS.get("next")
-    nxt_s = "abhi chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec me" if nxt else "-")
+    nxt_s = "chal raha hai" if STATUS["running"] else (f"{max(0, int(nxt - now))} sec" if nxt else "-")
     up = int(now - STATUS["started"])
     mem, lim = STATUS.get("mem_now", 0) or 0, MEM_LIMIT
     pct = max(0, min(100, int(mem * 100 / lim))) if lim else 0
-    # ---- proxy / pool
-    cur = get_proxy_url()
-    auto = proxy_auto()
-    s_url, _k = scanner_cfg()
+    # ---- proxy
+    cur, auto, f_url = get_proxy_url(), proxy_auto(), feed_url()
     with POOL_LOCK:
-        pnote, busy, prog = POOL["note"], POOL["busy"], POOL.get("prog")
+        pnote, found = POOL["note"], POOL["found"]
         pu = fmt_t(POOL["updated"]) if POOL["updated"] else "-"
     pg = pool_good_n()
     ready = pool_ready()
     if auto:
-        mode_chip = _chip("FREE AUTO", "g")
-        src = _chip("scanner: Cloudflare", "y") if s_url else _chip("scanner: Render khud", "g")
-        state = _chip(f"{pg} proxy ready", "g" if pg else "r") + (_chip("visit chalu", "g") if ready else _chip("visit ruki hain (scan poora hoga)", "y"))
+        src = f'<code>{esc(mask_feed(f_url))}</code>' if f_url else _chip("URL set nahi hai", "r")
+        top = ('<span class="pill">Chal raha hai</span>' if ready
+               else '<span class="pill y">Proxy list ka intezaar</span>')
     elif cur:
-        mode_chip, src = _chip("MANUAL PROXY", "g"), f'<code>{esc(mask_proxy(cur))}</code>'
-        state = ""
+        src, top = f'<code>{esc(mask_proxy(cur))}</code>', '<span class="pill">Manual proxy</span>'
     else:
-        mode_chip, src, state = _chip("PROXY BAND", "r"), "", _chip("server IP se visit ho rahi hai", "r")
-    prog_html = ""
-    if prog and prog.get("total"):
-        p = int(prog["done"] * 100 / prog["total"])
-        el = int(now - prog["t0"])
-        prog_html = (f'<div class="mu" style="margin-top:8px">Scan chal raha hai: <b>{prog["done"]}/{prog["total"]}</b> test, '
-                     f'{prog["good"]} chale &middot; {el//60}m{el%60}s</div><div class="bar"><i style="width:{p}%"></i></div>')
-    elif busy:
-        prog_html = '<div class="mu" style="margin-top:8px">Scan shuru ho raha hai (list download)...</div>'
+        src, top = "", '<span class="pill r">Proxy band (server IP)</span>'
     if BACKUP_URL:
         ok_t = fmt_t(BACKUP["last_ok"]) if BACKUP["last_ok"] else "abhi tak nahi"
         backup_html = (f'<div>{_chip("ON", "g") if not BACKUP["err"] else _chip("ERROR: " + esc(BACKUP["err"]), "r")}'
-                       f'<span class="mu">aakhri save: {ok_t} &middot; {BACKUP["size"] // 1024} KB'
+                       f'<span class="mu">aakhri save {ok_t} &middot; {BACKUP["size"] // 1024} KB'
                        f'{" &middot; restore: " + esc(BACKUP["restored"]) if BACKUP["restored"] else ""}</span></div>'
-                       '<form method="post" action="/backup"><div class="btns"><button name="act" value="save">Abhi backup lo</button>'
-                       '<button name="act" value="restore" class="grey" onclick="return confirm(\'Backup se wapas laun? Abhi ka data badal jayega.\')">Restore karo</button></div></form>')
+                       '<form method="post" action="/backup"><div class="btns"><button name="act" value="save" class="soft">Abhi backup lo</button>'
+                       '<button name="act" value="restore" class="ghost" onclick="return confirm(\'Backup se wapas laun? Abhi ka data badal jayega.\')">Restore karo</button></div></form>')
     else:
-        backup_html = f'{_chip("OFF", "r")}<span class="mu">Render env me <code>BACKUP_URL</code> daalo (apna backup link).</span>'
-    mode_line = (f"insaan mode &middot; 30 min me {VISITS_MIN}-{VISITS_MAX} visit &middot; page par {DWELL_MIN}-{DWELL_MAX}s"
+        backup_html = f'{_chip("OFF", "r")}<span class="mu">Render env me <code>BACKUP_URL</code> daalo.</span>'
+    mode_line = (f"30 min me {VISITS_MIN}-{VISITS_MAX} visit &middot; page par {DWELL_MIN}-{DWELL_MAX}s"
                  if HUMAN else f"har {EVERY//60} min &middot; page par {DWELL}s")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Keepalive</title><style>{CSS}</style></head><body>
-<h1>Keepalive</h1>
-<div class="card">
-  <div>{mode_chip}{src}{state}</div>
-  {prog_html}
-  <div class="mu" style="margin-top:10px">RAM {mem:.0f} / {lim} MB &middot; peak {STATUS['mem_peak']:.0f} MB &middot; browser: {esc(STATUS['engine'])}, restarts {STATUS['restarts']}</div>
-  <div class="bar mem{' hi' if pct > 85 else ''}"><i style="width:{pct}%"></i></div>
-  <div class="mu">Server {up//3600}h {up%3600//60}m se chalu &middot; agla round: {nxt_s} &middot; {mode_line}<br>Pool: {esc(pnote)} &middot; update {pu}</div>
+<title>Keepalive</title><style>{CSS}</style></head><body><div class="wrap">
+<div class="top"><h1>Keepalive</h1>{top}</div>
+<div class="grid">
+  <div class="stat"><div class="k">Apps</div><div class="v">{len(apps)}</div><div class="s">{awake_n} jaag rahe</div></div>
+  <div class="stat"><div class="k">Proxy ready</div><div class="v">{pg}</div><div class="s">list me {found} &middot; {pu}</div></div>
+  <div class="stat"><div class="k">RAM</div><div class="v">{mem:.0f}<span class="s"> / {lim} MB</span></div><div class="bar{' hi' if pct > 85 else ''}"><i style="width:{pct}%"></i></div></div>
+  <div class="stat"><div class="k">Agli visit</div><div class="v" style="font-size:19px;padding-top:3px">{nxt_s}</div><div class="s">uptime {up//3600}h {up%3600//60}m</div></div>
 </div>
-<div class="card"><h2>Apps ({len(apps)})</h2>{''.join(app_rows) or '<div class="mu">Koi app nahi. Neeche se jodo.</div>'}
-<form method="post" action="/add" style="margin-top:10px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
-<div class="btns"><button>Add karo</button></div></form>
-<form method="post" action="/run"><div class="btns"><button class="grey">Abhi visit karo</button></div></form></div>
-<div class="card"><h2>Proxy</h2>
+<div class="card"><h2>Apps</h2>{''.join(app_rows) or '<div class="mu">Koi app nahi. Neeche se jodo.</div>'}
+<form method="post" action="/add" style="margin-top:6px"><input type="text" name="url" placeholder="https://myapp.blitz.cloud" required>
+<div class="btns"><button>Add karo</button><button class="ghost" formaction="/run">Abhi visit karo</button></div></form>
+<div class="mu" style="margin-top:8px">{mode_line}</div></div>
+<div class="card"><h2>Proxy list (API)</h2>
+<div>{src}</div>
+<form method="post" action="/feed" autocomplete="off">
+  <input type="text" name="feed_url" placeholder="https://.../api/proxies?key=..." autocomplete="off">
+  <div class="btns"><button name="act" value="save">Save + list lo</button><button name="act" value="refresh" class="soft">Abhi list lo</button></div>
+</form>
+<div class="mu" style="margin-top:10px">{esc(pnote)}. List har ~5 min me khud aati hai (max {FEED_MAX}), Render koi proxy test nahi karta, har visit par naya random proxy. Box khali + &ldquo;Abhi list lo&rdquo; = isi URL se turant.</div>
+<details><summary>Manual proxy / Band</summary>
 <form method="post" action="/proxy" autocomplete="off">
-  <input type="text" name="proxy_url" placeholder="manual proxy: http://user:pass@host:port" autocomplete="off">
-  <div class="btns"><button name="act" value="save">Manual save</button><button name="act" value="auto" class="grey">Free auto</button><button name="act" value="off" class="red">Band</button></div>
-</form>
-<div class="mu" style="margin-top:8px">Band = server ka apna IP. Free auto me pehle {POOL_START_TEST} proxy ka scan hota hai, tab tak visit ruki rehti hain.</div>
-<h2 style="margin-top:16px">Free auto: scanner kaun?</h2>
-<form method="post" action="/scanner" autocomplete="off">
-  <input type="text" name="scanner_url" placeholder="https://naam.akaunt.workers.dev" autocomplete="off">
-  <input type="password" name="scanner_key" placeholder="scanner password (SCAN_KEY)" autocomplete="off">
-  <div class="btns"><button name="act" value="remote">Cloudflare use karo</button><button name="act" value="local" class="grey">Render khud test kare</button></div>
-</form>
-<div class="mu" style="margin-top:8px">Dono button Free auto bhi on kar dete hain. Cloudflare ka URL/password pehle check hota hai. Password dikhta nahi; box khali = purana.</div></div>
-<div class="card"><h2>Backup</h2>
-{backup_html}
-<div class="mu" style="margin-top:6px">Apps, proxy settings, Cloudflare setting, log, cookies aur proxy pool is backup me jaate hain; disk reset par apne aap wapas aate hain.</div></div>
-<div class="card"><h2>Log <a class="mu" href="/log.txt">download</a></h2>{''.join(logs) or '<div class="mu">Abhi log khali hai.</div>'}</div>
-<div class="mu">Render free ka disk restart par saaf hota hai; apps list <code>APP_URLS</code> se wapas banegi.</div>
+  <input type="text" name="proxy_url" placeholder="http://user:pass@host:port" autocomplete="off">
+  <div class="btns"><button name="act" value="save" class="soft">Manual save</button><button name="act" value="auto" class="ghost">API list wapas</button><button name="act" value="off" class="red">Band</button></div>
+</form></details></div>
+<div class="card"><h2>Backup</h2>{backup_html}
+<div class="mu" style="margin-top:8px">Apps, proxy list ka URL, proxy settings, log aur cookies backup me jaate hain; disk reset ke baad apne-aap wapas aate hain aur list turant API se aa jati hai.</div></div>
+<div class="card"><h2>Log <a href="/log.txt">download</a></h2>{''.join(logs) or '<div class="mu">Abhi log khali hai.</div>'}</div>
+<div class="mu" style="text-align:center">Server {up//3600}h {up%3600//60}m se chalu &middot; peak RAM {STATUS['mem_peak']:.0f} MB &middot; browser {esc(STATUS['engine'])}, restarts {STATUS['restarts']}</div>
+</div>
 <script>
 document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',()=>{{setTimeout(()=>f.querySelectorAll('button').forEach(b=>b.disabled=true),0)}}));
 setInterval(()=>{{const a=document.activeElement;if(!a||a.tagName!=='INPUT')location.reload()}},12000);
@@ -2368,54 +2179,36 @@ class H(BaseHTTPRequestHandler):
                 if not backup_save():
                     return self._send(400, f"Backup nahi hua: {BACKUP['err']}", "text/plain; charset=utf-8")
             return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
-        if path == "/scanner":
+        if path == "/feed":
             act = (form.get("act") or [""])[0]
-            if act == "local":
-                try:
-                    save_scanner("local", *scanner_alt())
-                except Exception as e:
-                    return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
-                if not proxy_auto():
-                    try:
-                        save_proxy_url(PROXY_AUTO)
-                        RESTART["why"] = "free auto mode on"
-                    except Exception:
-                        pass
-                log_event("scanner: Render khud test karega")
+            raw = (form.get("feed_url") or [""])[0].strip()
+            if act == "refresh" and not raw:
+                if not feed_url():
+                    return self._send(400, "Pehle proxy list ka URL save karo.", "text/plain; charset=utf-8")
                 POOL_EVT.set()
                 return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
-            if act == "remote":
-                raw = (form.get("scanner_url") or [""])[0].strip()
-                key = (form.get("scanner_key") or [""])[0].strip()
-                cur_url, cur_key = scanner_cfg()
-                url = norm_scanner_url(raw) if raw else (cur_url or None)
-                if not url:
-                    return self._send(400, "Scanner URL likho, jaise https://naam.akaunt.workers.dev", "text/plain; charset=utf-8")
-                if not key and url == cur_url:
-                    key = cur_key                                   # box khali = purana password
-                try:
-                    d = scanner_fetch(url, key, timeout=15)         # save se pehle check
-                    if not isinstance(d, dict) or "good" not in d:
-                        raise ValueError("format galat")
-                except urllib.error.HTTPError as e:
-                    why = "password (SCAN_KEY) galat" if e.code == 403 else f"HTTP {e.code}"
-                    return self._send(400, f"Scanner ne mana kiya: {why}. Save nahi hua.", "text/plain; charset=utf-8")
-                except Exception as e:
-                    return self._send(400, f"Scanner se list nahi mili ({type(e).__name__}). URL check karo. Save nahi hua.",
-                                      "text/plain; charset=utf-8")
-                try:
-                    save_scanner("remote", url, key)
-                except Exception as e:
-                    return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
+            url = norm_feed_url(raw) if raw else None
+            if not url:
+                return self._send(400, "URL likho, jaise https://proxy.xyz.blitz.cloud/api/proxies?key=...", "text/plain; charset=utf-8")
+            try:
+                lst = feed_fetch(url, timeout=20)                  # save se pehle check
+                if not lst:
+                    raise ValueError("list khali")
+            except urllib.error.HTTPError as e:
+                why = "key galat" if e.code in (401, 403) else f"HTTP {e.code}"
+                return self._send(400, f"API ne mana kiya: {why}. Save nahi hua.", "text/plain; charset=utf-8")
+            except Exception as e:
+                return self._send(400, f"List nahi mili ({type(e).__name__}). URL check karo. Save nahi hua.", "text/plain; charset=utf-8")
+            try:
+                save_feed(url)
                 if not proxy_auto():
-                    try:
-                        save_proxy_url(PROXY_AUTO)
-                        RESTART["why"] = "free auto mode on"
-                    except Exception:
-                        pass
-                log_event(f"scanner: Cloudflare ({url}), abhi list me {len(d.get('good') or [])}")
-                POOL_EVT.set()
-                return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
+                    save_proxy_url(PROXY_AUTO)
+                    RESTART["why"] = "API list mode on"
+            except Exception as e:
+                return self._send(500, f"Save nahi hua: {type(e).__name__}", "text/plain; charset=utf-8")
+            pool_set(lst, quiet=True)                              # list abhi se pool me, 5 min ka intezaar nahi
+            log_event(f"proxy list URL save: {mask_feed(url)} ({len(lst)} proxy)")
+            POOL_EVT.set()
             return self._send(303, "", "text/plain; charset=utf-8", {"Location": "/"})
         with LOCK:
             apps = load_apps()
@@ -2478,7 +2271,7 @@ class H(BaseHTTPRequestHandler):
 BACKUP_URL = os.environ.get("BACKUP_URL", "").strip()          # SECRET: https://.../p/<key>  (sirf Render env me, GitHub me kabhi nahi); /sql apne aap jud jata hai
 BACKUP_EVERY = max(120, env_int("BACKUP_EVERY_SEC", 600))
 BACKUP = {"last_ok": 0.0, "err": "", "size": 0, "method": "", "restored": ""}
-_SMALL = ("apps.json", "proxy.txt", "scanner.json")
+_SMALL = ("apps.json", "proxy.txt", "feed.json")
 
 
 def _backup_collect():
@@ -2495,8 +2288,8 @@ def _backup_collect():
             except OSError:
                 pass
     with POOL_LOCK:
-        good = [{"hp": g["hp"], "ms": g["ms"], "t": g.get("t"), "cc": POOL["cc"].get(g["hp"])} for g in POOL["good"][:100]]
-    files["pool.json"] = json.dumps({"t": time.time(), "good": good}).encode()
+        good = list(POOL["list"][:300])                      # chhota fallback; asli list restore ke baad API se turant aati hai
+    files["pool.json"] = json.dumps({"t": time.time(), "list": good}).encode()
     return files
 
 
@@ -2585,19 +2378,13 @@ def backup_restore():
         raw = gzip.decompress(base64.b64decode("".join(d for _p, d in sorted(ps))))
         if rel == "pool.json":
             d = json.loads(raw.decode())
-            if time.time() - float(d.get("t", 0)) < 3 * 3600:
-                good = [{"hp": g["hp"], "ms": int(g.get("ms", 3000)), "t": float(g.get("t") or d.get("t", 0))} for g in d.get("good", [])
-                        if isinstance(g, dict) and check_proxy(g.get("hp"))
-                        and time.time() - float(g.get("t") or d.get("t", 0)) < POOL_KEEP_AGE]
-                with POOL_LOCK:
-                    POOL["good"] = good
-                    for g in d.get("good", []):
-                        if g.get("cc"):
-                            POOL["cc"][g["hp"]] = g["cc"]
-                    POOL["note"] = f"backup se {len(good)} proxy (purane ho sakte hain)"
-                    POOL["updated"] = time.time()
-                if len(good) >= POOL_MIN_READY:
-                    POOL_STATE["warm"] = True
+            if time.time() - float(d.get("t", 0)) < 3 * 3600 and not POOL["list"]:
+                lst = [x for x in d.get("list", []) if isinstance(x, str) and check_proxy(x)]
+                if lst:
+                    with POOL_LOCK:
+                        POOL["list"] = lst
+                        POOL["note"] = f"backup se {len(lst)} proxy (API se jaldi badal jayengi)"
+                        POOL["updated"] = time.time()
             continue
         dest = os.path.realpath(os.path.join(DATA, rel))
         if not dest.startswith(base + os.sep):              # path se bahar likhna mana
